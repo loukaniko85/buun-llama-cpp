@@ -110,7 +110,7 @@ jobs:
           push: true
           build-args: |
             CUDA_VERSION=12.8.1
-            CUDA_DOCKER_ARCH=75;86;89;120
+            CUDA_DOCKER_ARCH=120
             IMAGE_SOURCE=https://github.com/loukaniko85/buun-llama-cpp
             IMAGE_URL=https://github.com/loukaniko85/buun-llama-cpp
           tags: |
