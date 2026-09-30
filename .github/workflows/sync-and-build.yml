@@ -59,6 +59,17 @@ jobs:
             --jq '.[] | select(.path != ".github/workflows/sync-and-build.yml") | select(.state != "disabled_manually") | .id' \
             | xargs -r -n1 gh workflow disable || true
 
+      - name: Fix build context (.dockerignore)
+        run: |
+          if grep -qxF 'models/*' .dockerignore 2>/dev/null; then
+            grep -vxF 'models/*' .dockerignore > .dockerignore.tmp
+            mv .dockerignore.tmp .dockerignore
+            echo "removed 'models/*' exclusion - chat templates must reach the build context"
+          else
+            echo "no 'models/*' exclusion present"
+          fi
+          cat .dockerignore
+
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
