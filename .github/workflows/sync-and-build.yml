@@ -24,7 +24,7 @@ permissions:
 jobs:
   sync-and-build:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
     steps:
       - name: Checkout fork
         uses: actions/checkout@v6
@@ -85,11 +85,14 @@ jobs:
       - name: Check for existing image
         id: check
         run: |
+          exists=false
           if docker manifest inspect "ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:head-${{ steps.sync.outputs.head }}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+            exists=true
           fi
+          if docker manifest inspect "ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:up-${{ steps.sync.outputs.up }}" >/dev/null 2>&1; then
+            exists=true
+          fi
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
