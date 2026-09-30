@@ -1,0 +1,102 @@
+name: Build rocm server image
+
+on:
+  workflow_run:
+    workflows: ["Sync upstream and build server image"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Rebuild even if an image for the current commit already exists
+        type: boolean
+        default: false
+
+concurrency:
+  group: rocm-build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  rocm-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Fix build context (.dockerignore)
+        run: |
+          if grep -qxF 'models/*' .dockerignore 2>/dev/null; then
+            grep -vxF 'models/*' .dockerignore > .dockerignore.tmp
+            mv .dockerignore.tmp .dockerignore
+            echo "removed 'models/*' exclusion - chat templates must reach the build context"
+          else
+            echo "no 'models/*' exclusion present"
+          fi
+          cat .dockerignore
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift /usr/local/share/powershell /usr/local/lib/node_modules /opt/az /usr/share/miniconda
+          df -h / | tail -1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for existing image
+        id: check
+        run: |
+          HEAD12=$(git rev-parse --short=12 HEAD)
+          echo "head=$HEAD12" >> "$GITHUB_OUTPUT"
+          exists=false
+          if docker manifest inspect "ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:head-${HEAD12}-rocm" >/dev/null 2>&1; then
+            exists=true
+          fi
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push rocm server image
+        id: build
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: .devops/rocm.Dockerfile
+          target: server
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            ROCM_VERSION=7.2.1
+            AMDGPU_VERSION=7.2.1
+            ROCM_DOCKER_ARCH=gfx1100
+            IMAGE_SOURCE=https://github.com/loukaniko85/buun-llama-cpp
+            IMAGE_URL=https://github.com/loukaniko85/buun-llama-cpp
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:server-rocm
+            ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:head-${{ steps.check.outputs.head }}-rocm
+          cache-from: type=gha,scope=rocm
+          cache-to: type=gha,mode=max,scope=rocm
+
+      - name: Summary
+        if: steps.build.outputs.digest != ''
+        run: |
+          {
+            echo "### buun-llama-cpp rocm (AMD gfx1100) image built"
+            echo ""
+            echo "- pull: \`docker pull ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:server-rocm\`"
+            echo "- fork head: \`${{ steps.check.outputs.head }}\`"
+            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
