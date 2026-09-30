@@ -56,7 +56,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh workflow list --all --json id,path,state \
-            --jq '.[] | select(.path != ".github/workflows/sync-and-build.yml" and .path != ".github/workflows/legacy-build.yml") | select(.state != "disabled_manually") | .id' \
+            --jq '.[] | select(.path != ".github/workflows/sync-and-build.yml" and .path != ".github/workflows/legacy-build.yml" and .path != ".github/workflows/rocm-build.yml") | select(.state != "disabled_manually") | .id' \
             | xargs -r -n1 gh workflow disable || true
 
       - name: Fix build context (.dockerignore)
