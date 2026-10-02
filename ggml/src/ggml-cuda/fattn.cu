@@ -12,6 +12,55 @@
 #include <atomic>
 #include <sys/stat.h>
 #include <vector>
+
+bool ggml_cuda_flash_attn_ext_ordered(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * keys, const ggml_tensor * values,
+        const ggml_tensor * ids, const ggml_tensor * mask_cells) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(ctx, dst, keys, values, ids, mask_cells);
+    return false;
+#else
+    const ggml_tensor * q = dst->src[0];
+    if (ggml_cuda_info().devices[ctx.device].cc != 860 || !q ||
+            q->type != GGML_TYPE_F32 || q->ne[0] != 256 || q->ne[1] != 1 ||
+            q->ne[2] != 24 || q->ne[3] < 1 || q->ne[3] > 4 ||
+            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+            ggml_get_op_params_f32(dst, 1) != 0.f || ggml_get_op_params_f32(dst, 2) != 0.f ||
+            ggml_flash_attn_ext_get_prec(dst) != GGML_PREC_F32 || dst->src[4] ||
+            keys->type != GGML_TYPE_F16 || values->type != GGML_TYPE_F16 ||
+            keys->ne[0] != 512 || values->ne[0] != 512 ||
+            keys->ne[1] != values->ne[1] || keys->ne[1] < 2051 ||
+            keys->ne[2] != 1 || keys->ne[3] != 1 || values->ne[2] != 1 || values->ne[3] != 1 ||
+            keys->nb[0] != sizeof(half) || values->nb[0] != sizeof(half) ||
+            ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) ||
+            ggml_nelements(ids) != 2051*q->ne[3] ||
+            mask_cells->type != GGML_TYPE_F16 || mask_cells->ne[0] != 1 ||
+            mask_cells->ne[1] != keys->ne[1] || mask_cells->ne[2] != q->ne[3] ||
+            mask_cells->ne[3] != 1 || mask_cells->nb[1] != sizeof(half)) return false;
+
+    // Metadata-only views of the original pools. The selected width is logical;
+    // ordered IDs map every load to a physical row, including the mask load.
+    ggml_tensor k = *dst->src[1], v = *dst->src[2], mask = *dst->src[3], out = *dst;
+    for (auto pair : {std::make_pair(&k, keys), std::make_pair(&v, values)}) {
+        pair.first->data = pair.second->data;
+        pair.first->nb[0] = sizeof(half);
+        pair.first->nb[1] = pair.second->nb[1];
+        pair.first->nb[2] = 256*sizeof(half);
+        pair.first->nb[3] = 0;
+    }
+    mask.data = mask_cells->data;
+    mask.ne[0] = mask_cells->ne[1];
+    mask.nb[0] = sizeof(half);
+    mask.nb[1] = mask.nb[2] = mask.nb[3] = mask_cells->nb[2];
+    out.src[1] = &k;
+    out.src[2] = &v;
+    out.src[3] = &mask;
+    ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 8, 1, false, true>(
+        ctx, &out, (const int32_t *) ids->data);
+    return true;
+#endif
+}
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
 template <int ncols1, bool oob>
@@ -336,6 +385,23 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
+    // A 12-head group wastes four columns in the 8-head tile. For long
+    // prefill on SM86, three 4-head tiles reuse each KV tile across twice
+    // as many queries. Preserve the original compacted sparse route: changing
+    // its tile also changes its gather cost and reduction. Small batches keep
+    // their original stream-K splits.
+    if constexpr (DKQ == 256 && DV == 256 && !V_is_K_view) {
+        if (cc == 860 && use_gqa_opt && Q->type == GGML_TYPE_F32 &&
+                K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
+                Q->ne[2] == 24 && K->ne[2] == 2 && Q->ne[3] == 1 &&
+                Q->ne[1] >= 2048 && ggml_flash_attn_ext_get_prec(dst) == GGML_PREC_F32 &&
+                ggml_get_op_params_f32(dst, 2) == 0.0f && !dst->src[4] &&
+                !ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 8, 8)) {
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4, V_is_K_view>(ctx, dst);
+            return;
+        }
+    }
+
     // For 6:1 GQA, the generic 8-head tile wastes two columns. On SM80/D256,
     // three 2-head tiles are faster for full 1K-aligned prefill batches, where
     // both layouts avoid stream-K fixup. Tail batches keep the original layout.
@@ -433,9 +499,8 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1(ggml_backend_cuda_c
     ggml_cuda_flash_attn_ext_mma_turbo_case<DKQ, DV, 4, 8, type_K, type_V>(ctx, dst);
 }
 
-// Turbo MMA fused dispatch: ncols2 selection based on GQA ratio.
-template <int DKQ, int DV, ggml_type type_K, ggml_type type_V>
-static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// Shared by tile dispatch and eligibility: RDNA has no ncols2=1 MMA kernel.
+static int ggml_cuda_fattn_turbo_ncols2(const ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -461,21 +526,29 @@ static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_c
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
     if (use_gqa_opt && gqa_ratio > 4) {
-        ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 8, type_K, type_V>(ctx, dst);
-        return;
+        return 8;
     }
 
     if (use_gqa_opt && gqa_ratio > 2) {
-        ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 4, type_K, type_V>(ctx, dst);
-        return;
+        return 4;
     }
 
     if (use_gqa_opt && gqa_ratio > 1) {
-        ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 2, type_K, type_V>(ctx, dst);
-        return;
+        return 2;
     }
 
-    ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 1, type_K, type_V>(ctx, dst);
+    return 1;
+}
+
+template <int DKQ, int DV, ggml_type type_K, ggml_type type_V>
+static void ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    switch (ggml_cuda_fattn_turbo_ncols2(dst)) {
+        case 8: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 8, type_K, type_V>(ctx, dst); break;
+        case 4: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 4, type_K, type_V>(ctx, dst); break;
+        case 2: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 2, type_K, type_V>(ctx, dst); break;
+        case 1: ggml_cuda_flash_attn_ext_mma_turbo_switch_ncols1<DKQ, DV, 1, type_K, type_V>(ctx, dst); break;
+        default: GGML_ABORT("invalid Turbo attention tile");
+    }
 }
 #endif
 
@@ -2531,8 +2604,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (turbo_mma_fused && (turbo_matched || turbo_fused_asym || turbo1_tcq_matched) && Q->ne[1] <= 4 &&
         (Q->ne[0] == 128 || Q->ne[0] == 256) &&
         (turing_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ||
-         // AMD RDNA WMMA: trying D=128 AND D=256 (gemma) after lifting the upstream DKQ<=128 cap.
-         amd_wmma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc))) {
+         // Without an eligible grouped-head tile, use the materialize/vector
+         // fallback instead of launching RDNA's NO_DEVICE_CODE specialization.
+         (amd_wmma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+          ggml_cuda_fattn_turbo_ncols2(dst) > 1))) {
         cudaStream_t stream = ctx.stream();
         int device;
         CUDA_CHECK(cudaGetDevice(&device));

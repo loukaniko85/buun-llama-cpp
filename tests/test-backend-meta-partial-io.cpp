@@ -107,6 +107,18 @@ int main() {
         std::vector<uint8_t> mirror = random_bytes(nbytes);
         ggml_backend_tensor_set(tensor, mirror.data(), 0, nbytes);
 
+        // Masked prefill can leave an empty cross-backend input without storage
+        // or a resolvable shard layout. Like synchronous I/O, async zero-length
+        // transfers must not dispatch to the backend or require allocated data.
+        ggml_tensor empty = *tensor;
+        empty.ne[0] = 0;
+        empty.data = nullptr;
+        uint8_t untouched = 0x5a;
+        ggml_backend_tensor_get_async(backend.get(), &empty, &untouched, 0, 0);
+        ggml_backend_tensor_set_async(backend.get(), &empty, &untouched, 0, 0);
+        ggml_backend_synchronize(backend.get());
+        GGML_ASSERT(untouched == 0x5a);
+
         const std::pair<size_t, size_t> ranges[] = {
             { 0, 1 }, { 7, 1001 }, { row - 3, 6 }, { row, row }, { 5*row + 11, 3*row }, { nbytes - 13, 13 },
             { tensor->nb[2] < nbytes ? tensor->nb[2] - 5 : 3, 10 }, { 0, nbytes },

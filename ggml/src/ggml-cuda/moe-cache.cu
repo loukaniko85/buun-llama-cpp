@@ -367,6 +367,7 @@ struct moe_cache_node {
     int n_pins = 0;
     bool planned = false;
     bool dispatched = false;
+    bool deferred_collect = false;
     bool owns_active = true;
     bool composite = false;
     int n_result_rows = 0;
@@ -404,9 +405,21 @@ static std::unordered_map<int, moe_cache_physical_budget> g_physical_budgets;
 struct moe_cache_scope_frame {
     moe_cache_session * requested = nullptr;
     moe_cache_session * active = nullptr;
+    struct {
+        const ggml_tensor * source = nullptr;
+        ggml_tensor * destination = nullptr;
+        int device = -1;
+        uint64_t written = 0;
+        moe_cache_node * pending = nullptr;
+        bool failed = false;
+    } output;
 };
 static thread_local std::vector<moe_cache_scope_frame> g_session_stack;
 static thread_local int g_session_suppressed = 0;
+// Retain the entire owner (including composite leases)
+// until the scheduler consumes device output. Never detach pins from the node.
+static thread_local std::unique_ptr<moe_cache_node> g_pending_output;
+static void moe_cache_retire_pending();
 static size_t moe_cache_trim_session(
         moe_cache_session & session, int physical_device);
 
@@ -1158,6 +1171,7 @@ static bool moe_cache_type_supported(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q2_0_G128:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -1688,7 +1702,9 @@ static bool moe_cache_prepare_budget(
     ggml_cuda_set_device(device.logical);
     size_t free_memory = 0;
     size_t total_memory = 0;
-    cudaError_t error = cudaMemGetInfo(&free_memory, &total_memory);
+    // Use the same physical VRAM accounting as model fitting on HIP, where
+    // hipMemGetInfo can overcharge small VMM mappings.
+    cudaError_t error = ggml_cuda_device_memory_info(device.logical, &free_memory, &total_memory);
     if (!moe_cache_cuda_ok(device, error, "memory query", false)) {
         device.dead.store(true);
         return false;
@@ -2239,6 +2255,7 @@ static void moe_cache_free_device(moe_cache_device & device) {
 }
 
 static void moe_cache_session_destroy(void * opaque) {
+    moe_cache_retire_pending();
     moe_cache_session * session = (moe_cache_session *)opaque;
     if (!session) {
         return;
@@ -2375,7 +2392,233 @@ static int moe_cache_prefill_copy(void * opaque, void * backend_opaque,
     return true;
 }
 
+#if !defined(GGML_USE_HIP)
+static int moe_cache_prefetch_supported(void * backend_opaque, const ggml_tensor * source) {
+    auto backend = (ggml_backend_t) backend_opaque;
+    if (!backend || !ggml_backend_is_cuda(backend) || !source || source->view_src ||
+            source->type != GGML_TYPE_Q2_0 || !source->buffer ||
+            source->buffer->buft != ggml_backend_cuda_host_buffer_type() ||
+            ggml_backend_buffer_get_usage(source->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+            (source->flags & GGML_TENSOR_FLAG_INPUT) || !ggml_is_contiguous(source) ||
+            source->ne[2] < 1 || source->ne[2] > 512 || source->ne[3] != 1 ||
+            source->nb[2] % sizeof(uint4) || ggml_nbytes(source) > (256ull << 20)) return 0;
+    auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    return !ctx->external_capture && ggml_cuda_info().device_count == 1 &&
+            ggml_cuda_info().devices[ctx->device].cc == 860;
+}
+
+struct moe_cache_prefetch_job {
+    moe_cache_session * session;
+    const void * source;
+    int device;
+    cudaStream_t stream = nullptr;
+    bool leased = false;
+    bool drained = false;
+    bool success = false;
+};
+
+static thread_local moe_cache_prefetch_job * g_prefetch_job = nullptr;
+
+static bool moe_cache_prefetch_drain(moe_cache_prefetch_job * job) {
+    if (job->drained) return job->success;
+    ggml_cuda_set_device(job->device);
+    const bool ok = cudaStreamSynchronize(job->stream) == cudaSuccess;
+    if (!ok) (void) cudaGetLastError();
+    if (job->leased) {
+        std::lock_guard<std::mutex> lock(job->session->mu);
+        auto source = job->session->active_sources.find(job->source);
+        GGML_ASSERT(source != job->session->active_sources.end() && source->second.references > 0);
+        if (--source->second.references == 0) job->session->active_sources.erase(source);
+        job->session->active_nodes--;
+        job->session->idle_cv.notify_all();
+        job->leased = false;
+    }
+    job->drained = true;
+    job->success = ok;
+    return ok;
+}
+
+static int moe_cache_prefetch_end(void * opaque) {
+    std::unique_ptr<moe_cache_prefetch_job> job((moe_cache_prefetch_job *) opaque);
+    if (!job) return 0;
+    bool ok = moe_cache_prefetch_drain(job.get());
+    ok = (cudaStreamDestroy(job->stream) == cudaSuccess) && ok;
+    if (!ok) (void) cudaGetLastError();
+    if (g_prefetch_job == job.get()) g_prefetch_job = nullptr;
+    return ok;
+}
+
+static void * moe_cache_prefetch_begin(void * opaque, void * backend_opaque,
+        const ggml_tensor * source, ggml_tensor * destination,
+        const uint32_t * selected, size_t selected_words) {
+    if (g_prefetch_job || !opaque || !moe_cache_prefetch_supported(backend_opaque, source) ||
+            !destination || !ggml_are_same_layout(source, destination) ||
+            !destination->buffer || destination->view_src || !destination->data ||
+            uintptr_t(destination->data) % alignof(uint4) ||
+            ggml_backend_buffer_get_usage(destination->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) return nullptr;
+    if (selected && selected_words < size_t((source->ne[2] + 31) / 32)) return nullptr;
+    const auto used = [&](int e) { return !selected || ((selected[e / 32] >> (e % 32)) & 1u); };
+    auto * ctx = (ggml_backend_cuda_context *) ((ggml_backend_t) backend_opaque)->context;
+    if (destination->buffer->buft != ggml_backend_cuda_buffer_type(ctx->device)) return nullptr;
+    ggml_cuda_set_device(ctx->device);
+    cudaPointerAttributes attributes = {};
+    if (cudaPointerGetAttributes(&attributes, source->data) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    if (attributes.type != cudaMemoryTypeHost) return nullptr;
+    // The destination lifetime begins at the current split, so earlier splits
+    // may still have used this allocation. Drain them before the copy stream
+    // touches it; current-split compute is submitted after begin returns.
+    ggml_backend_synchronize((ggml_backend_t) backend_opaque);
+    auto & session = *(moe_cache_session *) opaque;
+    std::unique_ptr<moe_cache_prefetch_job> job(new (std::nothrow)
+            moe_cache_prefetch_job{&session, source->data, ctx->device});
+    if (!job) return nullptr;
+    if (cudaStreamCreateWithFlags(&job->stream, cudaStreamNonBlocking) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
+    }
+    bool resident[512] = {};
+    bool ready = false;
+    {
+        std::lock_guard<std::mutex> lock(session.mu);
+        if (!session.stopping && !session.dormant && session.active_scopes > 0 && session.devices.size() == 1) {
+            try {
+                auto & lease = session.active_sources[source->data];
+                lease.bytes = std::max(lease.bytes, ggml_nbytes(source));
+                lease.references++;
+                session.active_nodes++;
+                job->leased = true;
+                auto & device = *session.devices[0];
+                const int pool_id = moe_cache_find_pool(device, source->nb[2], source->type);
+                if (!device.dead && pool_id >= 0 && device.pools[pool_id]->slab) {
+                    const auto & pool = *device.pools[pool_id];
+                    moe_cache_pp_copy_refs refs = {};
+                    int hits = 0;
+                    for (int e = 0; e < source->ne[2]; ++e) {
+                        if (!used(e)) continue;
+                        const auto found = pool.map.find({source->data, e});
+                        if (found != pool.map.end() && found->second <= 65535 &&
+                                pool.slots[found->second].state == moe_cache_slot_state::valid) {
+                            resident[e] = true;
+                            refs.packed[hits++] = (uint32_t(e) << 16) | uint32_t(found->second);
+                        }
+                    }
+                    if (hits) {
+                        const size_t vectors = source->nb[2] / sizeof(uint4);
+                        const unsigned blocks = std::min<size_t>(32, (vectors + 255) / 256);
+                        moe_cache_pp_gather<<<dim3(blocks, hits), 256, 0, job->stream>>>(
+                                (const uint4 *) pool.slab, (uint4 *) destination->data, vectors, refs);
+                        ready = cudaGetLastError() == cudaSuccess;
+                    } else ready = true;
+                } else ready = true;
+            } catch (const std::bad_alloc &) {
+                ready = false;
+            }
+        }
+        // Finish resident reads while the pool is protected. The long host DMA
+        // below needs only the source lease; allocator trim can free the pool
+        // during current-split compute without waiting on our dispatch lock.
+        ready = (cudaStreamSynchronize(job->stream) == cudaSuccess) && ready;
+    }
+    for (int e = 0; ready && e < source->ne[2];) {
+        if (!used(e)) { ++e; continue; }
+        int end = e + 1;
+        while (end < source->ne[2] && used(end) && resident[end] == resident[e]) ++end;
+        const size_t padding = end < source->ne[2] && !used(end) ? std::min<size_t>(source->nb[2], 512) : 0;
+        const size_t offset = size_t(resident[e] ? end : e) * source->nb[2];
+        const size_t bytes = (resident[e] ? 0 : size_t(end - e) * source->nb[2]) + padding;
+        if (bytes) {
+            ready = cudaMemcpyAsync((char *) destination->data + offset,
+                    (const char *) source->data + offset, bytes,
+                    cudaMemcpyHostToDevice, job->stream) == cudaSuccess;
+        }
+        e = end;
+    }
+    if (!ready) {
+        moe_cache_prefetch_end(job.release());
+        return nullptr;
+    }
+    g_prefetch_job = job.get();
+    return job.release();
+}
+#endif
+
+static int moe_cache_output_supported(void * backend_opaque, const ggml_tensor * source) {
+#if defined(GGML_USE_HIP)
+    GGML_UNUSED_VARS(backend_opaque, source);
+    return 0;
+#else
+    auto backend = (ggml_backend_t) backend_opaque;
+    if (!backend || !ggml_backend_is_cuda(backend) || !source ||
+            source->op != GGML_OP_MUL_MAT_ID || source->type != GGML_TYPE_F32 ||
+            source->view_src || !ggml_is_contiguous(source) || source->ne[0] < 1 ||
+            ggml_nrows(source) < 1 || ggml_nrows(source) > 64) return 0;
+    const auto * ctx = (ggml_backend_cuda_context *) backend->context;
+    return !ctx->external_capture && ggml_cuda_info().device_count == 1 &&
+        ggml_cuda_info().devices[ctx->device].cc == 860;
+#endif
+}
+
+static moe_cache_scope_frame * moe_cache_output_frame(void * session) {
+    if (!session || g_session_suppressed || g_session_stack.empty() ||
+            g_session_stack.back().active != session) return nullptr;
+    return &g_session_stack.back();
+}
+
+static int moe_cache_output_bind(void * session, void * backend_opaque,
+        const ggml_tensor * source, ggml_tensor * destination) {
+    moe_cache_retire_pending();
+    auto * frame = moe_cache_output_frame(session);
+    if (!frame) return 0;
+    GGML_ASSERT(frame->output.written == 0);
+    frame->output = {};
+    if (!moe_cache_output_supported(backend_opaque, source) ||
+            !source->buffer || !ggml_backend_buffer_is_host(source->buffer) ||
+            !destination || destination->view_src || !ggml_are_same_layout(source, destination)) return 0;
+    auto * ctx = (ggml_backend_cuda_context *) ((ggml_backend_t) backend_opaque)->context;
+    if (!destination->buffer || destination->buffer->buft != ggml_backend_cuda_buffer_type(ctx->device) ||
+            ggml_backend_buffer_get_usage(destination->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) return 0;
+    frame->output.source = source;
+    frame->output.destination = destination;
+    frame->output.device = ctx->device;
+    return 1;
+}
+
+static int moe_cache_output_copy(void * session, void * backend_opaque,
+        const ggml_tensor * source, ggml_tensor * destination) {
+    moe_cache_retire_pending();
+    auto * frame = moe_cache_output_frame(session);
+    if (!frame) return 0;
+    if (frame->output.source != source || frame->output.destination != destination) {
+        // Once hits bypass host storage, their matching copy must consume them.
+        GGML_ASSERT(frame->output.written == 0);
+        return 0;
+    }
+    const bool failed = frame->output.failed;
+    const uint64_t written = frame->output.written;
+    frame->output = {};
+    if (failed) return -1;
+    if (!written) return 0;
+    auto * ctx = (ggml_backend_cuda_context *) ((ggml_backend_t) backend_opaque)->context;
+    ggml_cuda_set_device(ctx->device);
+    const int rows = ggml_nrows(source);
+    for (int row = 0; row < rows;) {
+        if (written & (UINT64_C(1) << row)) { ++row; continue; }
+        int end = row + 1;
+        while (end < rows && !(written & (UINT64_C(1) << end))) ++end;
+        const size_t offset = size_t(row)*source->nb[1];
+        CUDA_CHECK(cudaMemcpyAsync((char *) destination->data + offset,
+                (const char *) source->data + offset, size_t(end - row)*source->nb[1],
+                cudaMemcpyHostToDevice, ctx->stream()));
+        row = end;
+    }
+    return 1;
+}
+
 static void moe_cache_session_enter(void * opaque) {
+    moe_cache_retire_pending();
     if (g_session_suppressed > 0) {
         g_session_suppressed++;
         return;
@@ -2387,7 +2630,7 @@ static void moe_cache_session_enter(void * opaque) {
             return;
         }
         try {
-            g_session_stack.push_back({session, nullptr});
+            g_session_stack.push_back({session, nullptr, {}});
         } catch (...) {
             g_session_suppressed++;
         }
@@ -2399,7 +2642,7 @@ static void moe_cache_session_enter(void * opaque) {
             return;
         }
         try {
-            g_session_stack.push_back({session, nullptr});
+            g_session_stack.push_back({session, nullptr, {}});
         } catch (...) {
             g_session_suppressed++;
         }
@@ -2410,14 +2653,14 @@ static void moe_cache_session_enter(void * opaque) {
             return;
         }
         try {
-            g_session_stack.push_back({session, nullptr});
+            g_session_stack.push_back({session, nullptr, {}});
         } catch (...) {
             g_session_suppressed++;
         }
         return;
     }
     try {
-        g_session_stack.push_back({session, session});
+        g_session_stack.push_back({session, session, {}});
     } catch (...) {
         g_session_suppressed++;
         return;
@@ -2426,6 +2669,7 @@ static void moe_cache_session_enter(void * opaque) {
 }
 
 static void moe_cache_session_leave(void * opaque) {
+    moe_cache_retire_pending();
     if (g_session_suppressed > 0) {
         g_session_suppressed--;
         return;
@@ -2454,6 +2698,7 @@ static void * moe_cache_begin(
         const char * name, const void * host_base, size_t expert_size,
         int64_t n_in, int64_t n_out, int wtype, int64_t n_expert,
         int64_t n_tokens, int64_t n_rows) {
+    moe_cache_retire_pending();
     if (g_session_suppressed > 0 || g_session_stack.empty()) {
         return nullptr;
     }
@@ -2795,14 +3040,24 @@ static void * moe_cache_begin(
     return node.release();
 }
 
+static bool moe_cache_sm86_pq2_projection(const moe_cache_node & node) {
+    // Qualified on Mooney's separate expert projections, including MTP verify.
+    // Do not alter other codecs, fused FFNs or unmeasured GPU architectures.
+    return node.wtype == GGML_TYPE_Q2_0_G128 && node.n_tokens >= 1 && node.n_tokens <= 6 &&
+        node.n_mid == node.n_out &&
+        ((node.n_in == 2560 && node.n_out == 640) ||
+         (node.n_in == 640 && node.n_out == 2560)) &&
+        ggml_cuda_info().devices[node.device->logical].cc == 860;
+}
+
 static int moe_cache_overlap_rows(const moe_cache_node & node, int n_ids) {
     const int configured = node.session->config.overlap_cpu_rows;
     if (configured >= 0) {
         return std::min(configured, std::max(0, n_ids - 1));
     }
-    // EXL3 CPU trellis decoding can take longer than the GPU's entire share.
-    // Keep resident rows on GPU by default; explicit CPU-overlap counts still win.
-    if (ggml_type_is_exl3((ggml_type)node.wtype)) {
+    // EXL3 trellis decoding and the qualified PQ2 projections can make the
+    // CPU share slower than the GPU's whole share. Explicit counts still win.
+    if (ggml_type_is_exl3((ggml_type)node.wtype) || moe_cache_sm86_pq2_projection(node)) {
         return 0;
     }
     if (n_ids <= 1 || node.n_tokens <= 0 || n_ids % node.n_tokens != 0) {
@@ -3278,13 +3533,17 @@ static int moe_cache_dispatch_internal(
                     up_min, up_max, gate_min, gate_max,
                     device.compute_stream);
         } else {
+            // This short down projection underutilizes the generic channel
+            // kernel. Keep its resident rows on the cache's warp-per-row path.
+            const bool dedicated = moe_cache_sm86_pq2_projection(*node) && n_in == 640 &&
+                session.config.dedicated_down_mmv != 0;
             (void)ggml_cuda_moe_cache_mmv(
                     pool.slab, (ggml_type)wtype,
                     (const char *)device.d_act_q8, d_ids,
                     use_activation_map ? d_ids + n_hits : nullptr,
                     device.d_out, n_in, n_out, pool.n_slots,
                     (int64_t)pool.expert_size, n_hits, activation_rows,
-                    false, device.compute_stream);
+                    dedicated, device.compute_stream);
         }
         ok = moe_cache_cuda_ok(
                 device, cudaPeekAtLastError(), "expert matvec launch", true);
@@ -3302,10 +3561,11 @@ static int moe_cache_dispatch_internal(
         ggml_cuda_moe_cache_mmv_path::generic;
     if (ok && full) {
         // The short Q2 down projection benefits from the dedicated MMV on
-        // consumer Blackwell. Leave unmeasured shapes and architectures alone.
+        // SM86 and consumer Blackwell. Leave unmeasured shapes and architectures alone.
+        const int down_cc = ggml_cuda_info().devices[device.logical].cc;
         const bool dedicated_down = session.config.dedicated_down_mmv >= 0
             ? session.config.dedicated_down_mmv != 0
-            : ggml_cuda_info().devices[device.logical].cc == GGML_CUDA_CC_BLACKWELL &&
+            : (down_cc == 860 || down_cc == GGML_CUDA_CC_BLACKWELL) &&
               down_pool->wtype == GGML_TYPE_Q2_0 && n_out == 640 && node->n_out == 2560;
         down_mmv_path = ggml_cuda_moe_cache_mmv(
                 down_pool->slab, (ggml_type)down_pool->wtype,
@@ -3419,6 +3679,17 @@ static void moe_cache_collect_scatter(
     }
 }
 
+struct moe_cache_device_rows { int rows[64]; };
+
+static __global__ void moe_cache_output_scatter(const float * source, float * destination,
+        int64_t columns, moe_cache_device_rows map) {
+    const int row = blockIdx.y;
+    for (int64_t col = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+            col < columns; col += int64_t(gridDim.x)*blockDim.x) {
+        destination[int64_t(map.rows[row])*columns + col] = source[int64_t(row)*columns + col];
+    }
+}
+
 static int moe_cache_collect(
         void * opaque, int n_hits, float * const * dst_rows, int64_t n_out) {
     moe_cache_node * node = (moe_cache_node *)opaque;
@@ -3446,6 +3717,20 @@ static int moe_cache_collect(
             }
         }
 
+        // The single-device staging planner also wraps its one child in a
+        // composite. Preserve its physical-to-logical row map while reusing
+        // the ordinary collector's device-output handoff and failure handling.
+        auto * frame = moe_cache_output_frame(node->session);
+        if (node->children.size() == 1 && n_hits <= 64 && frame && frame->output.source) {
+            auto * child = node->children.front().get();
+            float * mapped[64];
+            for (int i = 0; i < child->n_result_rows; ++i) mapped[i] = dst_rows[child->row_indices[i]];
+            const int ok = moe_cache_collect(child, child->n_result_rows, mapped, n_out);
+            node->deferred_collect = child->deferred_collect;
+            node->dispatched = false;
+            return ok;
+        }
+
         for (size_t index = 0; index < node->children.size(); index++) {
             child_ok[index] = moe_cache_collect_enqueue(
                     *node->children[index],
@@ -3471,6 +3756,53 @@ static int moe_cache_collect(
             *node, n_hits, dst_rows, n_out, nullptr, n_hits)) {
         return 0;
     }
+    auto * frame = moe_cache_output_frame(node->session);
+    const bool single_projection = frame && frame->output.source && !node->host_base2 &&
+        frame->output.source->src[0] && frame->output.source->src[0]->data == node->host_base;
+    if (frame && frame->output.source && (node->host_base3 || single_projection) && n_hits <= 64 &&
+            frame->output.device == node->device->logical && !frame->output.written &&
+            frame->output.source->ne[0] == n_out) {
+        const auto * source = frame->output.source;
+        const uintptr_t base = (uintptr_t) source->data;
+        const size_t row_bytes = n_out*sizeof(float);
+        moe_cache_device_rows map{};
+        uint64_t written = 0;
+        bool eligible = true;
+        for (int row = 0; row < n_hits; ++row) {
+            const uintptr_t address = (uintptr_t) dst_rows[row];
+            if (address < base || address - base >= ggml_nbytes(source) || (address - base) % row_bytes) {
+                eligible = false;
+                break;
+            }
+            const int index = (address - base)/row_bytes;
+            if (written & (UINT64_C(1) << index)) { eligible = false; break; }
+            map.rows[row] = index;
+            written |= UINT64_C(1) << index;
+        }
+        if (eligible) {
+            auto & device = *node->device;
+            ggml_cuda_set_device(device.logical);
+            bool ok = !device.dead.load() && !moe_cache_fail(*node->session, "collect");
+            if (ok) {
+                const dim3 grid(std::min<int64_t>(32, (n_out + 255)/256), n_hits);
+                moe_cache_output_scatter<<<grid, 256, 0, device.compute_stream>>>(
+                        device.d_out, (float *) frame->output.destination->data, n_out, map);
+                ok = moe_cache_cuda_ok(device, cudaPeekAtLastError(), "output device scatter", true);
+            }
+            if (ok) {
+                // CPU hit rows are intentionally absent. Retain ownership and
+                // delay the same synchronization until output_copy, before any
+                // consumer runs. The ordinary host-output route is unchanged.
+                GGML_ASSERT(!g_pending_output && !frame->output.pending);
+                node->deferred_collect = true;
+                frame->output.pending = node;
+            } else {
+                ok = moe_cache_collect_finish(*node, false);
+            }
+            if (ok) frame->output.written = written;
+            return ok ? 1 : 0;
+        }
+    }
     bool ok = moe_cache_collect_enqueue(*node, n_hits);
     ok = moe_cache_collect_finish(*node, ok);
     if (ok) {
@@ -3482,6 +3814,11 @@ static int moe_cache_collect(
 static void moe_cache_end(void * opaque) {
     std::unique_ptr<moe_cache_node> node((moe_cache_node *)opaque);
     if (!node) {
+        return;
+    }
+    if (node->deferred_collect) {
+        GGML_ASSERT(!g_pending_output);
+        g_pending_output = std::move(node);
         return;
     }
 
@@ -3532,6 +3869,30 @@ static void moe_cache_end(void * opaque) {
         node->dispatch_lock.unlock();
         moe_cache_trim_session(session, node->device->physical);
     }
+}
+
+static void moe_cache_retire_pending() {
+    if (!g_pending_output) return;
+    auto owner = std::move(g_pending_output);
+    // The one-device composite owns source leases; its child owns slot pins
+    // and the dispatch lock. Keep both alive until the stream is finished.
+    GGML_ASSERT(!owner->composite || owner->children.size() == 1);
+    auto * producer = owner->composite ? owner->children.front().get() : owner.get();
+    GGML_ASSERT(producer->deferred_collect && producer->dispatched);
+    const bool ok = moe_cache_collect_finish(*producer,
+            !moe_cache_fail(*producer->session, "collect-retire"));
+    bool found = false;
+    for (auto & frame : g_session_stack) {
+        if (frame.output.pending == producer) {
+            frame.output.pending = nullptr;
+            frame.output.failed = !ok;
+            found = true;
+        }
+    }
+    GGML_ASSERT(found);
+    producer->deferred_collect = false;
+    owner->deferred_collect = false;
+    moe_cache_end(owner.release());
 }
 
 // Called under session.mu and the device dispatch lock. Retire a few unpinned
@@ -4060,6 +4421,7 @@ static void * moe_cache_fused_plan(
         float gate_min, float gate_max,
         const int32_t * ids, int n_ids, int64_t n_tokens,
         const float * const * act_rows, uint64_t * hit_mask) {
+    moe_cache_retire_pending();
     if (hit_mask) {
         *hit_mask = 0;
     }
@@ -4153,13 +4515,14 @@ static void * moe_cache_fused_plan(
 
     bool stream_stage = false;
 #if !defined(GGML_USE_HIP)
-    // Measured for small speculative Q2 batches on consumer Blackwell. Use the
+    // Small speculative Q2 batches on consumer Ampere and Blackwell use the
     // same full-FFN planner for resident and transient experts, without changing
     // the existing multi-device routing or larger prompt-processing batches.
     stream_stage = down && session->devices.size() == 1 && n_tokens <= 4 &&
         up->type == GGML_TYPE_Q2_0 && down->type == up->type &&
         up->expert_size == down->expert_size && up->expert_size <= 512*1024 &&
-        ggml_cuda_info().devices[session->devices.front()->logical].cc == GGML_CUDA_CC_BLACKWELL;
+        (ggml_cuda_info().devices[session->devices.front()->logical].cc == 860 ||
+         ggml_cuda_info().devices[session->devices.front()->logical].cc == GGML_CUDA_CC_BLACKWELL);
 #endif
     if (down && (expert_parallel || stream_stage)) {
         if (!expert_parallel) {
@@ -4664,6 +5027,7 @@ static void moe_cache_invalidate_session(
 }
 
 static void moe_cache_invalidate(const void * base, size_t size) {
+    moe_cache_retire_pending();
     if (!base || size == 0 ||
         g_session_count.load(std::memory_order_acquire) == 0) {
         return;
@@ -4676,6 +5040,7 @@ static void moe_cache_invalidate(const void * base, size_t size) {
 
 static size_t moe_cache_trim_session(
         moe_cache_session & session, int physical_device) {
+    moe_cache_retire_pending();
     moe_cache_device * selected = nullptr;
     for (auto & device_ptr : session.devices) {
         if (device_ptr->physical == physical_device) {
@@ -4716,6 +5081,15 @@ static size_t moe_cache_trim_session(
 }
 
 extern "C" size_t ggml_moe_cache_trim(int device) {
+    // Drain before the registry mutex: an invalidator may hold it while waiting
+    // for this node's retained source lease. Also avoid reacquiring dispatch_mu.
+    moe_cache_retire_pending();
+#if !defined(GGML_USE_HIP)
+    // An invalidator can hold g_registry_mu while waiting for this thread's
+    // source lease. Drain lookahead before taking that mutex during allocation
+    // pressure, otherwise trim and lease release could wait for each other.
+    if (g_prefetch_job) moe_cache_prefetch_drain(g_prefetch_job);
+#endif
     if (g_session_count.load(std::memory_order_acquire) == 0) {
         return 0;
     }
@@ -4745,6 +5119,14 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.session_enter = moe_cache_session_enter;
     ggml_moe_cache.session_leave = moe_cache_session_leave;
     ggml_moe_cache.prefill_copy = moe_cache_prefill_copy;
+    ggml_moe_cache.output_supported = moe_cache_output_supported;
+    ggml_moe_cache.output_bind = moe_cache_output_bind;
+    ggml_moe_cache.output_copy = moe_cache_output_copy;
+#if !defined(GGML_USE_HIP)
+    ggml_moe_cache.prefetch_supported = moe_cache_prefetch_supported;
+    ggml_moe_cache.prefetch_begin = moe_cache_prefetch_begin;
+    ggml_moe_cache.prefetch_end = moe_cache_prefetch_end;
+#endif
     ggml_moe_cache.begin = moe_cache_begin;
     ggml_moe_cache.plan = moe_cache_plan;
     ggml_moe_cache.dispatch = moe_cache_dispatch;

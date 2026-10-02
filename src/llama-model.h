@@ -781,6 +781,12 @@ struct llama_model {
     llama_hadamard_rotations hadamard_rotations;
     llama_hadamard_rotations hadamard_inverses;
 
+    struct segmented_rotation_spec {
+        std::vector<int32_t> blocks;
+        std::vector<int32_t> signs;
+    };
+    std::map<std::string, segmented_rotation_spec> segmented_rotation_specs;
+
     // list of devices used in this model
     std::vector<llama_device> devices;
 

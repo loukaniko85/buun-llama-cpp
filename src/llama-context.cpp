@@ -92,9 +92,30 @@ static void llama_verify_hadamard_graph(
             continue;
         }
         const ggml_tensor * src = unwrap(node->src[1]);
-        const bool transformed = src && src->op == GGML_OP_MUL_MAT &&
+        bool transformed = src && src->op == GGML_OP_MUL_MAT &&
             ((const int32_t *) src->op_params)[1] == GGML_HINT_SRC0_IS_HADAMARD &&
             src->src[0] == it->second.rot;
+        if (!it->second.segments.empty()) {
+            // Match every segment, in order, to this weight's exact matrix
+            // and sign tensor, not merely any Hadamard somewhere upstream.
+            const auto & segments = it->second.segments;
+            const auto matches_segment = [&](const ggml_tensor * part, size_t index) {
+                part = unwrap(part);
+                return part && part->op == GGML_OP_MUL_MAT &&
+                    ((const int32_t *) part->op_params)[1] == GGML_HINT_SRC0_IS_HADAMARD &&
+                    part->src[0] == segments[index].rot && part->src[1]->op == GGML_OP_MUL &&
+                    part->src[1]->src[1] == segments[index].signs;
+            };
+            transformed = true;
+            for (size_t n = segments.size(); n > 1; --n) {
+                if (!src || src->op != GGML_OP_CONCAT || !matches_segment(src->src[1], n - 1)) {
+                    transformed = false;
+                    break;
+                }
+                src = unwrap(src->src[0]);
+            }
+            transformed = transformed && matches_segment(src, 0);
+        }
         if (!transformed) {
             throw std::runtime_error(format(
                 "Hadamard-folded weight '%s' is consumed without its activation transform; "

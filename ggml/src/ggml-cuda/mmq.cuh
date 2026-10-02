@@ -1039,8 +1039,18 @@ static __global__ void build_sparse_tile_prefix(
     *work_counter = 0;
 }
 
+static constexpr __device__ int mmq_sparse_occupancy(ggml_type type, int J, bool fallback) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
+    if (type == GGML_TYPE_Q2_0 && J == 64 && !fallback) {
+        // Two blocks fit when this sparse specialization stays within128 registers.
+        return 2;
+    }
+#endif
+    return ggml_cuda_mmq_get_occupancy(type, J, fallback);
+}
+
 template <ggml_type type, int J, bool fallback>
-__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
+__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), mmq_sparse_occupancy(type, J, fallback))
 static __global__ void mul_mat_q_sparse_persistent(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
         const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
@@ -1613,11 +1623,12 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     constexpr bool has_sparse_tiled_kernel =
         !fallback &&
         (J == 64 || J == 128) &&
-        (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
+        (type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
          type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_MXFP4);
-    const bool use_sparse_sm86 = cc == 860 && J == 128 &&
-        (type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_MXFP4);
-    const bool use_sparse_sm120 = cc == GGML_CUDA_CC_BLACKWELL &&
+    const bool use_sparse_sm86 = cc == 860 && (J == 128 || (type == GGML_TYPE_Q2_0 && J == 64 &&
+        args.ncols_max >= 1024 && ggml_cuda_highest_compiled_arch(cc) == 860)) &&
+        (type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_MXFP4);
+    const bool use_sparse_sm120 = cc == GGML_CUDA_CC_BLACKWELL && type != GGML_TYPE_Q2_0 &&
         args.ncols_max >= (type == GGML_TYPE_IQ2_XS ? 2048 : 128);
     const bool use_sparse_tiled_kernel = has_sparse_tiled_kernel && args.expert_bounds &&
         args.nsamples_y == 1 && (use_sparse_sm86 || use_sparse_sm120) &&
@@ -1657,7 +1668,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                     const uint3 nty_fd = init_fastdiv_values(nty);
                     build_sparse_tile_prefix<J><<<1, 1, 0, stream>>>(
                         args.expert_bounds, tile_prefix.get(), work_counter.get(), args.nchannels_y, nty);
-                    mul_mat_q_sparse_persistent<type, J, fallback><<<nsm, block_dims, nbytes_shared + persistent_header, stream>>>
+                    const int sparse_blocks = nsm * (cc == 860 && type == GGML_TYPE_Q2_0 && J == 64 ? 2 : 1);
+                    mul_mat_q_sparse_persistent<type, J, fallback><<<sparse_blocks, block_dims, nbytes_shared + persistent_header, stream>>>
                         (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tile_prefix.get(), work_counter.get(), args.y_scale,
                          blocks_per_ne00_fd, args.nrows_x, args.stride_row_x, args.ncols_y, args.nrows_dst,
                          channel_ratio_fd, args.stride_channel_x, nty_fd, args.nchannels_y);
@@ -1741,12 +1753,19 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
+    int J_cap = GGML_CUDA_MMQ_MAX_J;
+    // The SM86 sparse Q2 kernel trades tile width for two resident blocks. Keep
+    // smaller batches and binaries without the SM86 launch bound unchanged.
+    if (cc == 860 && ggml_cuda_highest_compiled_arch(cc) == 860 &&
+        type == GGML_TYPE_Q2_0 && !fallback && args.expert_bounds &&
+        args.nsamples_y == 1 && args.ncols_max >= 1024) {
+        J_cap = 64;
+    }
     // Ada MMQ tile cap re-port (was get_mmq_x_max_host_for_type<type>, commits ab5a019bc +
     // 239296c43, dropped by upstream #24127's config-table rewrite): on Ada Lovelace, cap the
     // MMQ tile width (J) at 64 for the small IQ/Q3_K quants where the wider 128 tile regressed.
     // Perf-only, NVIDIA-Ada-only, so it never touches Ampere/Volta/Blackwell/AMD, which keep the
     // upstream-tuned J=128 rows.
-    int J_cap = GGML_CUDA_MMQ_MAX_J;
     if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_ADA_LOVELACE) {
         switch (type) {
             case GGML_TYPE_IQ2_XXS:

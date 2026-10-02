@@ -622,6 +622,121 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
 
 static void test_bonsai_mapped_load(llama_model * model, gguf_context * meta, llama_model_params params);
 
+static void test_mooney_loader(const size_t seed) {
+    const auto metadata = [](bool mtp = false) {
+        auto meta = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+        if (mtp) {
+            // Reinterpret the second block as an embedded draft block, which
+            // a target-only load must skip even when its weights are folded.
+            GGML_ASSERT(gguf_remove_key(meta.get(), "qwen4exp.ple.layers") >= 0);
+            llama_model_saver saver(LLM_ARCH_QWEN4EXP, meta.get());
+            saver.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+            saver.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, uint32_t(1));
+            saver.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>({4, 0}));
+        }
+        // Callback models synthesize a combined gate/up tensor. Use the two
+        // required down tensors to exercise independent per-weight transforms.
+        gguf_set_val_u32(meta.get(), "qwen4exp.expert_feed_forward_length", 256);
+        const char * names[] = {"blk.0.ffn_down_exps.weight", "blk.1.ffn_down_exps.weight"};
+        gguf_set_val_u32(meta.get(), "lowbitflash.rot.version", 1);
+        gguf_set_arr_str(meta.get(), "lowbitflash.rot.weight_names", names, 2);
+        const int32_t blocks[] = {128, 128};
+        std::vector<int32_t> signs(256, 1);
+        for (int i = 0; i < 2; ++i) {
+            signs[3] = i ? -1 : 1; // same shape, deliberately different transforms
+            signs[131] = i ? 1 : -1; // second segment must use its own offset
+            gguf_set_arr_data(meta.get(), (std::string("lowbitflash.rot.blocks.")+names[i]).c_str(),
+                              GGUF_TYPE_INT32, blocks, 2);
+            gguf_set_arr_data(meta.get(), (std::string("lowbitflash.rot.signs.")+names[i]).c_str(),
+                              GGUF_TYPE_INT32, signs.data(), signs.size());
+        }
+        return meta;
+    };
+    for (bool mtp : {false, true})
+    for (bool load_mtp : {false, true})
+    for (int offload : {0, 99}) {
+        if (load_mtp && !mtp) continue;
+        if (offload && !ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) continue;
+        auto meta = metadata(mtp);
+        auto mp = llama_model_default_params();
+        mp.load_mtp = load_mtp;
+        mp.n_gpu_layers = offload;
+        mp.progress_callback = silent_model_load_progress;
+        tensor_data_params data = {seed, 0.01f};
+        llama_model_ptr real(llama_model_init_from_user(meta.get(), set_tensor_data, &data, mp));
+        GGML_ASSERT(real);
+        mp.no_alloc = true;
+        llama_model_ptr dry(llama_model_init_from_user(meta.get(), set_tensor_data, nullptr, mp));
+        GGML_ASSERT(dry && real->memory_breakdown() == dry->memory_breakdown());
+        for (auto * model : {real.get(), dry.get()}) {
+            GGML_ASSERT(model->hadamard_rotations.size() == (mtp && !load_mtp ? 1 : 2));
+            ggml_tensor * shared = nullptr;
+            std::vector<ggml_tensor *> sign_tensors;
+            for (const auto & [weight, transform] : model->hadamard_rotations) {
+                GGML_ASSERT(transform.segments.size() == 2);
+                int offset = 0;
+                for (const auto & segment : transform.segments) {
+                    if (!shared) shared = segment.rot;
+                    GGML_ASSERT(segment.rot == shared);
+                    GGML_ASSERT((segment.rot->data == nullptr) == model->hparams.no_alloc);
+                    GGML_ASSERT((segment.signs->data == nullptr) == model->hparams.no_alloc);
+                    GGML_ASSERT(segment.offset == offset);
+                    GGML_ASSERT(std::find(sign_tensors.begin(), sign_tensors.end(), segment.signs) == sign_tensors.end());
+                    sign_tensors.push_back(segment.signs);
+                    if (!model->hparams.no_alloc) {
+                        std::vector<float> actual(128);
+                        ggml_backend_tensor_get(segment.signs, actual.data(), 0, actual.size()*sizeof(float));
+                        const bool second_weight = std::string(weight->name) == "blk.1.ffn_down_exps.weight";
+                        for (int j = 0; j < 128; ++j) {
+                            const int position = offset + j;
+                            const float expected = (position == 3 && second_weight) ||
+                                                   (position == 131 && !second_weight) ? -1.0f : 1.0f;
+                            GGML_ASSERT(actual[j] == expected);
+                        }
+                    }
+                    offset += 128;
+                }
+            }
+            auto cp = llama_context_default_params();
+            cp.n_ctx = 256;
+            cp.n_batch = cp.n_ubatch = 32;
+            cp.type_k = cp.type_v = GGML_TYPE_F16;
+            llama_context_ptr context(llama_init_from_model(model, cp));
+            GGML_ASSERT(context); // first-graph verifier must accept both exact sign chains
+        }
+    }
+    for (int bad = 0; bad < 6; ++bad) {
+        auto meta = metadata();
+        const char * key = "lowbitflash.rot.signs.blk.0.ffn_down_exps.weight";
+        if (bad == 0) gguf_set_val_u32(meta.get(), "lowbitflash.rot.version", 2);
+        if (bad == 1) {
+            std::vector<int32_t> signs(256, 1); signs[0] = 0;
+            gguf_set_arr_data(meta.get(), key, GGUF_TYPE_INT32, signs.data(), signs.size());
+        }
+        if (bad == 2) gguf_set_val_str(meta.get(), key, "not an array");
+        if (bad == 3) {
+            const int32_t block = 192;
+            gguf_set_arr_data(meta.get(), "lowbitflash.rot.blocks.blk.0.ffn_down_exps.weight", GGUF_TYPE_INT32, &block, 1);
+        }
+        if (bad == 4) {
+            const char * names[] = {"token_embd.weight"};
+            gguf_set_arr_str(meta.get(), "lowbitflash.rot.inverse_names", names, 1);
+        }
+        if (bad == 5) {
+            const char * names[] = {"blk.9.ffn_down_exps.weight"};
+            gguf_set_arr_str(meta.get(), "lowbitflash.rot.weight_names", names, 1);
+            const int32_t block = 256;
+            std::vector<int32_t> signs(256, 1);
+            gguf_set_arr_data(meta.get(), "lowbitflash.rot.blocks.blk.9.ffn_down_exps.weight", GGUF_TYPE_INT32, &block, 1);
+            gguf_set_arr_data(meta.get(), "lowbitflash.rot.signs.blk.9.ffn_down_exps.weight", GGUF_TYPE_INT32, signs.data(), signs.size());
+        }
+        auto mp = llama_model_default_params();
+        mp.no_alloc = true;
+        llama_model_ptr model(llama_model_init_from_user(meta.get(), set_tensor_data, nullptr, mp));
+        GGML_ASSERT(!model);
+    }
+}
+
 static void test_bonsai_loader(const size_t seed) {
     const auto metadata = [] {
         auto meta = get_gguf_ctx(LLM_ARCH_LLAMA, false);
@@ -1076,44 +1191,91 @@ static void test_qwen4_qsa_layout_cpu(llama_model * model, size_t seed) {
 
     llama_memory_hybrid_idx_context qsa(memory);
     const auto run = [&](uint32_t ratio, bool blk_bias, llama_seq_id seq,
-                         const std::vector<llama_pos> & query_pos) {
+                         const std::vector<llama_pos> & query_pos, uint32_t n_query = 1,
+                         uint32_t n_streams = 1, bool causal = true) {
         GGML_ASSERT(query_pos.size() == 1 || query_pos.size() == 4);
-        const int64_t n_kv = qsa.get_idx()->get_n_kv();
+        llama_memory_hybrid_idx_context query_ctx(memory);
+        GGML_ASSERT(n_streams <= query_ctx.get_n_stream());
+        const int64_t n_kv = query_ctx.get_idx()->get_n_kv();
         const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
         ggml_init_params tensor_params = { 128*1024, nullptr, true };
         ggml_context_ptr tensor_ctx(ggml_init(tensor_params));
         GGML_ASSERT(tensor_ctx != nullptr);
-        ggml_tensor * cell_blk = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_I32, n_kv, 1);
-        ggml_tensor * blk_cells = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_I32, ratio*n_blocks, 1);
-        ggml_tensor * blk_pos = ggml_new_tensor_1d(tensor_ctx.get(), GGML_TYPE_I32, 4*n_blocks);
+        ggml_tensor * cell_blk = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_I32, n_kv, n_streams);
+        ggml_tensor * blk_cells = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_I32, ratio*n_blocks, n_streams);
+        ggml_tensor * blk_pos = ggml_new_tensor_1d(tensor_ctx.get(), GGML_TYPE_I32, 4*n_blocks*n_streams);
         ggml_tensor * bias = ggml_new_tensor_3d(
-                tensor_ctx.get(), GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, 1, 1);
+                tensor_ctx.get(), GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_query, n_streams);
         ggml_backend_ptr cpu(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
         GGML_ASSERT(cpu != nullptr);
         ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(tensor_ctx.get(), cpu.get()));
         GGML_ASSERT(buffer != nullptr);
 
-        llama_token token = 1;
-        std::vector<llama_pos> mutable_query_pos = query_pos;
-        int32_t n_seq_id = 1;
-        llama_seq_id * seq_ids = &seq;
-        int8_t output = 1;
+        const uint32_t n_tokens = n_query*n_streams;
+        std::vector<llama_token> tokens(n_tokens, 1);
+        std::vector<llama_pos> mutable_query_pos(query_pos.size()*n_tokens);
+        std::vector<int32_t> n_seq_id(n_tokens, 1);
+        std::vector<llama_seq_id> stream_seqs(n_streams);
+        std::vector<llama_seq_id *> seq_ids(n_tokens);
+        std::vector<int8_t> output(n_tokens, 1);
+        for (uint32_t s = 0; s < n_streams; ++s) {
+            stream_seqs[s] = seq + s;
+            for (uint32_t i = 0; i < n_query; ++i) {
+                seq_ids[s*n_query + i] = &stream_seqs[s];
+            }
+        }
+        for (size_t axis = 0; axis < query_pos.size(); ++axis) {
+            for (uint32_t s = 0; s < n_streams; ++s) {
+                for (uint32_t i = 0; i < n_query; ++i) {
+                    mutable_query_pos[axis*n_tokens + s*n_query + i] =
+                        query_pos[axis] + (axis == 0 ? llama_pos(i + 31*s) : 0);
+                }
+            }
+        }
         llama_ubatch query {
-            true, 1, 1, 1, 1, (uint32_t) query_pos.size(), &token, nullptr, mutable_query_pos.data(),
-            &n_seq_id, &seq_ids, &seq, nullptr, &output, {},
+            true, n_tokens, n_query, n_streams, n_streams, (uint32_t) query_pos.size(),
+            tokens.data(), nullptr, mutable_query_pos.data(),
+            n_seq_id.data(), seq_ids.data(), stream_seqs.data(), nullptr, output.data(), {},
         };
-        qsa.set_input_qsa(cell_blk, blk_cells, blk_pos, bias, &query, ratio, blk_bias, true);
+        query_ctx.set_input_qsa(cell_blk, blk_cells, blk_pos, bias, &query, ratio, blk_bias, causal);
 
         layout_result result {
             n_kv, n_blocks,
-            std::vector<int32_t>((int32_t *) cell_blk->data, (int32_t *) cell_blk->data + n_kv),
-            std::vector<int32_t>((int32_t *) blk_cells->data, (int32_t *) blk_cells->data + ratio*n_blocks),
-            std::vector<int32_t>((int32_t *) blk_pos->data, (int32_t *) blk_pos->data + 4*n_blocks),
+            std::vector<int32_t>((int32_t *) cell_blk->data, (int32_t *) cell_blk->data + n_kv*n_streams),
+            std::vector<int32_t>((int32_t *) blk_cells->data, (int32_t *) blk_cells->data + ratio*n_blocks*n_streams),
+            std::vector<int32_t>((int32_t *) blk_pos->data, (int32_t *) blk_pos->data + 4*n_blocks*n_streams),
             std::vector<float>((float *) bias->data,
-                               (float *) bias->data + (blk_bias ? n_blocks : n_kv)),
+                               (float *) bias->data + n_tokens*(blk_bias ? n_blocks : n_kv)),
         };
         return result;
     };
+
+    // Batched direct bias must match the general single-query path exactly.
+    // Cover the admission boundary, a partial tail and an older hole that must
+    // keep the fallback, while preserving maps and gather metadata as well.
+    for (int layout = 0; layout < 3; ++layout) {
+        idx->clear(false);
+        std::vector<llama_pos> positions;
+        for (llama_pos p = 0; p < (layout == 0 ? 96 : 95); ++p) {
+            if (layout != 2 || p < 40 || p >= 44) {
+                positions.push_back(p);
+            }
+        }
+        apply_text(0, positions);
+        for (uint32_t ratio : { 1u, 4u, 16u, 64u }) {
+            for (uint32_t count : { 31u, 32u, 33u }) {
+                const auto batched = run(ratio, true, 0, { 47 }, count);
+                for (uint32_t i = 0; i < count; ++i) {
+                    const auto single = run(ratio, true, 0, { llama_pos(47 + i) });
+                    GGML_ASSERT(batched.cell_blk == single.cell_blk);
+                    GGML_ASSERT(batched.blk_cells == single.blk_cells);
+                    GGML_ASSERT(batched.blk_pos == single.blk_pos);
+                    GGML_ASSERT(std::memcmp(batched.bias.data() + i*single.n_blocks,
+                            single.bias.data(), single.n_blocks*sizeof(float)) == 0);
+                }
+            }
+        }
+    }
 
     // An old incomplete block must remain hidden while the actual incomplete causal tail is
     // forced visible. Pin both the compact per-block and general per-cell bias contracts.
@@ -1222,6 +1384,47 @@ static void test_qwen4_qsa_layout_cpu(llama_model * model, size_t seed) {
     std::sort(expected_ratio8.begin(), expected_ratio8.end());
     std::sort(gathered_ratio8.begin(), gathered_ratio8.end());
     GGML_ASSERT(expected_ratio8 == gathered_ratio8);
+
+    // Physical streams have independent layouts and different query frontiers.
+    // Compare multi-query admission with the existing per-stream single-query
+    // fallback, including a hole in only one stream and non-causal attention.
+    params.kv_unified = false;
+    params.n_ctx = 256;
+    llama_context_ptr split_ctx(llama_init_from_model(model, params));
+    GGML_ASSERT(split_ctx != nullptr);
+    memory = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(split_ctx.get()));
+    GGML_ASSERT(memory != nullptr && memory->get_mem_idx() != nullptr);
+    idx = memory->get_mem_idx();
+    GGML_ASSERT(idx->get_n_stream() == 2);
+    for (bool hole : { false, true }) {
+        idx->clear(false);
+        for (llama_seq_id seq = 0; seq < 2; ++seq) {
+            std::vector<llama_pos> positions;
+            for (llama_pos p = 0; p < (seq == 0 ? 96 : 87); ++p) {
+                if (!hole || seq == 0 || p < 40 || p >= 44) {
+                    positions.push_back(p);
+                }
+            }
+            apply_text(seq, positions);
+        }
+        for (uint32_t ratio : { 1u, 4u, 16u, 64u }) {
+            for (uint32_t count : { 31u, 32u, 33u }) {
+                for (bool causal : { false, true }) {
+                    const auto batched = run(ratio, true, 0, { 47 }, count, 2, causal);
+                    for (uint32_t i = 0; i < count; ++i) {
+                        const auto single = run(ratio, true, 0, { llama_pos(47 + i) }, 1, 2, causal);
+                        GGML_ASSERT(batched.cell_blk == single.cell_blk);
+                        GGML_ASSERT(batched.blk_cells == single.blk_cells);
+                        GGML_ASSERT(batched.blk_pos == single.blk_pos);
+                        for (uint32_t s = 0; s < 2; ++s) {
+                            GGML_ASSERT(std::memcmp(batched.bias.data() + (s*count + i)*single.n_blocks,
+                                    single.bias.data() + s*single.n_blocks, single.n_blocks*sizeof(float)) == 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 static void test_qwen4_indexed_cache_admission(const size_t seed) {
@@ -4503,6 +4706,7 @@ int main(int argc, char ** argv) {
             test_qwen35_mtp_fused_qkv(seed, LLM_ARCH_QWEN35MOE);
         }
         if (arch_matches(arch_filter, LLM_ARCH_QWEN4EXP)) {
+            test_mooney_loader(seed);
             test_qwen4_ple_recurrent_resize(seed);
             test_qwen4_indexed_cache_admission(seed);
             test_qwen4_vbr_cuda(seed);

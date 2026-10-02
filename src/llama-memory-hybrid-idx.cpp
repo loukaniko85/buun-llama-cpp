@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-model.h"
+#include "llama-qsa-bias.h"
 
 
 #include <algorithm>
@@ -693,6 +694,20 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         const bool have_dead = !direct && n_bid < n_blocks;
         const int32_t dead_bid = have_dead ? n_bid : n_blocks - 1;
 
+        llama_qsa_bias_prefix bias_prefix { -1, 0 };
+        if (direct && blk_bias && n_tps >= 32) {
+            bool same_sequence = true;
+            for (int64_t ii = 0; ii < n_tps; ++ii) {
+                const int64_t i = s*n_tps + ii;
+                same_sequence &= ubatch->seq_id[i][0] == seq_of_stream && ubatch->pos[i] >= 0;
+            }
+            if (same_sequence) {
+                bias_prefix = llama_qsa_classify_bias_prefix(
+                        dst_blk_pos + n_blocks*n_ns + s*n_blocks,
+                        dst_blk_pos + 2*n_blocks*n_ns + s*n_blocks, n_blocks);
+            }
+        }
+
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
@@ -740,6 +755,11 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
             if (blk_bias) {
                 float * cur_blk_bias = dst_bias + i*n_blocks;
+
+                if (bias_prefix.full >= 0) {
+                    llama_qsa_fill_bias_prefix(cur_blk_bias, n_blocks, bias_prefix, q, r, causal_attn);
+                    continue;
+                }
 
                 for (int64_t b = 0; b < n_blocks; ++b) {
                     const int32_t rep = direct ? pos_at(1, b) : 0;

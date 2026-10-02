@@ -742,6 +742,31 @@ static inline __m256i q2_0_dot32(const uint8_t * packed_bytes, const int8_t * ac
 }
 #endif
 
+void ggml_vec_dot_q2_0_g128_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+#if defined(__AVX2__)
+    assert(n % QK2_0_G128 == 0 && nrc == 1);
+    UNUSED(nrc); UNUSED(bs); UNUSED(bx); UNUSED(by);
+    const block_q2_0_g128 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+    float sumf = 0.0f;
+    for (int i = 0; i < n / QK2_0_G128; ++i) {
+        float sumi = 0.0f;
+        for (int k = 0; k < QK2_0_G128 / QK8_0; ++k) {
+            const block_q8_0 * yb = &y[i * (QK2_0_G128 / QK8_0) + k];
+            const int dot = hsum_i32_8(q2_0_dot32(x[i].qs + k * 8, yb->qs));
+            // PQ2 shares the packed codes with Q2_0, but one weight scale
+            // covers four activation scales. Preserve the scalar FP order;
+            // only the exact integer products/reduction use vector lanes.
+            sumi += GGML_CPU_FP16_TO_FP32(yb->d) * dot;
+        }
+        sumf += GGML_CPU_FP16_TO_FP32(x[i].d) * sumi;
+    }
+    *s = sumf;
+#else
+    ggml_vec_dot_q2_0_g128_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
+#endif
+}
+
 void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
 #if defined(__AVX2__)
     assert(n % QK2_0 == 0 && nrc == 1);
@@ -795,10 +820,16 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 #endif
 }
 
-#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#if defined(__AVX2__)
 static inline __m256i q2_0_codes_dot(__m256i codes, const int8_t * act) {
+#if defined(__AVX512VNNI__) && defined(__AVX512VL__)
     return _mm256_dpbusd_epi32(_mm256_setzero_si256(), codes,
             _mm256_loadu_si256((const __m256i *) act));
+#else
+    // Codes are in [0, 3], so the signed 16-bit pair sums cannot saturate.
+    return _mm256_madd_epi16(_mm256_maddubs_epi16(codes,
+            _mm256_loadu_si256((const __m256i *) act)), _mm256_set1_epi16(1));
+#endif
 }
 
 struct q2_0_prepared_act {

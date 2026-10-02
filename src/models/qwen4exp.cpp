@@ -441,8 +441,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * h = inp->h;
     res->add_input(std::move(inp));
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos = build_inp_pos();
     auto * inp_attn = build_attn_inp_kv();
 
     // The checkpoint normalizes each HC stream independently, while applying
@@ -490,6 +489,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // The draft layer is dense attention. It intentionally has no QSA indexer
     // state even though the target's full-attention layers do.
     cur = build_layer_attn(inp_attn, nullptr, cur, inp_pos, sections, il);
+    if (!cur) {
+        // With no requested output, the single draft block only populates KV.
+        // Its attention/FFN outputs do not feed a later layer or recurrent state.
+        return;
+    }
     inpL = build_hc_combine(inpL, cur, inject, il);
     cb(inpL, "mtp_hc_attn_post", il);
 
@@ -504,6 +508,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     inpL = build_hc_combine(inpL, cur, inject, il);
     cb(inpL, "mtp_l_out", il);
 
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
     ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, hc*n_embd, n_tokens);
     ggml_tensor * flat_out = inp_out_ids ? ggml_get_rows(ctx0, flat, inp_out_ids) : flat;
 
@@ -1271,9 +1276,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     if (top_k) {
         cur = build_attn_qsa(inp, Qcur, Kcur, Vcur, top_k, kq_scale, il);
     } else {
+        const bool kv_only = il == (int) hparams.n_layer() && n_outputs == 0 &&
+            !cparams.embeddings && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,
-                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il, nullptr, kv_only);
+        if (kv_only) {
+            return nullptr;
+        }
     }
     cb(cur, "attn_pregate", il);
 

@@ -328,30 +328,33 @@ static void test_bonsai_codecs() {
 
 // Raw blocks cover every packed code byte and the entire signed activation
 // range, including -128 (not normally emitted by the float quantizer).
-static void test_q2_0_packed_dot() {
-    const auto * traits = ggml_get_type_traits_cpu(GGML_TYPE_Q2_0);
-    assert(ggml_blck_size(GGML_TYPE_Q2_0) == 64);
-    assert(ggml_type_size(GGML_TYPE_Q2_0) == 18);
+static void test_q2_0_packed_dot(ggml_type type) {
+    const auto * traits = ggml_get_type_traits_cpu(type);
+    const int qk = ggml_blck_size(type);
+    const size_t stride = ggml_type_size(type);
+    assert(qk == (type == GGML_TYPE_Q2_0 ? 64 : 128));
+    assert(stride == size_t(2 + qk / 4));
     assert(ggml_type_size(GGML_TYPE_Q8_0) == 34);
     for (const int n : {64, 128, 192, 256, 320, 640, 2560, 32768}) {
-        std::vector<uint8_t> x(ggml_row_size(GGML_TYPE_Q2_0, n));
+        if (n % qk) continue;
+        std::vector<uint8_t> x(ggml_row_size(type, n));
         std::vector<uint8_t> y(ggml_row_size(GGML_TYPE_Q8_0, n));
         for (int pattern = 0; pattern < 256; ++pattern) {
             float expected = 0.0f;
-            for (int block = 0; block < n / 64; ++block) {
+            for (int block = 0; block < n / qk; ++block) {
                 const float dx = (block % 5 == 4) ? 0.0f : 0.25f;
                 const ggml_fp16_t dxh = ggml_fp32_to_fp16(dx);
-                memcpy(x.data() + block * 18, &dxh, 2);
+                memcpy(x.data() + block * stride, &dxh, 2);
                 float partial = 0.0f;
-                for (int chunk = 0; chunk < 2; ++chunk) {
+                for (int chunk = 0; chunk < qk / 32; ++chunk) {
                     const float dy = chunk == 0 ? 0.5f : -2.0f;
                     const ggml_fp16_t dyh = ggml_fp32_to_fp16(dy);
-                    uint8_t * qy = y.data() + (block * 2 + chunk) * 34;
+                    uint8_t * qy = y.data() + (block * (qk / 32) + chunk) * 34;
                     memcpy(qy, &dyh, 2);
                     int dot = 0;
                     for (int b = 0; b < 8; ++b) {
                         const uint8_t packed = uint8_t(pattern + block * 13 + b * 17);
-                        x[block * 18 + 2 + chunk * 8 + b] = packed;
+                        x[block * stride + 2 + chunk * 8 + b] = packed;
                         for (int j = 0; j < 4; ++j) {
                             const int value = ((pattern + block * 31 + chunk * 97 + b * 4 + j) & 255) - 128;
                             qy[2 + b * 4 + j] = uint8_t(value);
@@ -445,7 +448,8 @@ int main(int argc, char * argv[]) {
 
     ggml_cpu_init();
     test_bonsai_codecs();
-    test_q2_0_packed_dot();
+    test_q2_0_packed_dot(GGML_TYPE_Q2_0);
+    test_q2_0_packed_dot(GGML_TYPE_Q2_0_G128);
     test_q2_0_repeated_experts();
 
     int num_failed = 0;

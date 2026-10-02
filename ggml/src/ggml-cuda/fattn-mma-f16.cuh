@@ -2224,7 +2224,8 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool sparse_mask,
-    ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, bool use_sparse = false>
+    ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, bool use_sparse = false,
+    bool ordered_indices = false>
 __launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_ext_f16(
         const char * Q_ptr,
@@ -2255,14 +2256,17 @@ static __global__ void flash_attn_ext_f16(
     const char * GGML_CUDA_RESTRICT V        = V_ptr;
     const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
     const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
-    const int  * GGML_CUDA_RESTRICT KV_max   = use_sparse ? nullptr : KV_max_ptr;
-    const int  * GGML_CUDA_RESTRICT sparse_indices = use_sparse ? KV_max_ptr : nullptr;
+    constexpr bool indexed = use_sparse || ordered_indices;
+    const int  * GGML_CUDA_RESTRICT KV_max   = indexed ? nullptr : KV_max_ptr;
+    const int  * GGML_CUDA_RESTRICT sparse_indices = indexed ? KV_max_ptr : nullptr;
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
 
     // Skip unused kernel variants for faster compilation:
-    static_assert(!use_sparse || (type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16 && !sparse_mask),
+    static_assert(!indexed || (type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16 && !sparse_mask),
         "finite-mask gather uses the F16 loader, independently of the sparse bitmap");
+    static_assert(!ordered_indices || (!use_sparse && DKQ == 256 && DV == 256 && ncols1 == 8 && ncols2 == 1),
+        "ordered indexing preserves dense reduction geometry and has no appended count array");
     if (use_sparse && !ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
         NO_DEVICE_CODE;
         return;
@@ -2361,7 +2365,7 @@ static __global__ void flash_attn_ext_f16(
 
         const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
         const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
-        const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*iter_j + jt)*ne11 : nullptr;
+        const int32_t * indices = indexed ? sparse_indices + (int64_t(sequence % ne33)*iter_j + jt)*ne11 : nullptr;
 
         const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
@@ -2373,12 +2377,12 @@ static __global__ void flash_attn_ext_f16(
         constexpr bool is_fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, sparse_mask, type_K, type_V, use_sparse>
+            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, sparse_mask, type_K, type_V, indexed>
                 (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
-            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, sparse_mask, type_K, type_V, use_sparse>
+            flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, sparse_mask, type_K, type_V, indexed>
                 (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         }
@@ -2410,7 +2414,7 @@ static __global__ void flash_attn_ext_f16(
 
     const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
     const float * sinks_f = sinks ? (const float *) sinks + zt_Q : nullptr;
-    const int32_t * indices = use_sparse ? sparse_indices + (int64_t(sequence % ne33)*iter_j + jt)*ne11 : nullptr;
+    const int32_t * indices = indexed ? sparse_indices + (int64_t(sequence % ne33)*iter_j + jt)*ne11 : nullptr;
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f;
 
@@ -2422,7 +2426,7 @@ static __global__ void flash_attn_ext_f16(
 
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
-    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, sparse_mask, type_K, type_V, use_sparse>
+    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, sparse_mask, type_K, type_V, indexed>
         (Q_f2, K_h2, V_h2, mask_h, indices, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
 #else
@@ -2441,8 +2445,9 @@ static __global__ void flash_attn_ext_f16(
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
 
-template <int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view = (DKQ == 576)>
-void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template <int DKQ, int DV, int ncols1, int ncols2, bool V_is_K_view = (DKQ == 576), bool ordered_indices = false>
+void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const int32_t * ordered_ids = nullptr) {
     const ggml_tensor * KQV = dst;
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
@@ -2534,14 +2539,32 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #endif // !defined(GGML_USE_MUSA)
     }
 
+    fattn_kernel_t schedule_kernel = nullptr;
+    if constexpr (ordered_indices) {
+        GGML_ASSERT(ordered_ids && logit_softcap == 0.0f && !use_sparse);
+        // Preserve the materialized kernel's stream-K partition, even if the
+        // indexed variant's register usage changes occupancy on a later build.
+        schedule_kernel = fattn_kernel;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, false, V_is_K_view, false,
+            GGML_TYPE_F16, GGML_TYPE_F16, false, true>;
+#if !defined(GGML_USE_MUSA)
+        static bool ordered_shared_raised[GGML_CUDA_MAX_DEVICES] = {};
+        if (!ordered_shared_raised[id]) {
+            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel),
+                cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+            ordered_shared_raised[id] = true;
+        }
+#endif
+    }
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, use_sparse, warp_size_host);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, true, true, true, use_sparse,
+         warp_size_host, ordered_ids, schedule_kernel);
 }
 
 
 #define DECL_FATTN_MMA_F16_CASE_VKV(DKQ, DV, ncols1, ncols2, VKV)                 \
     template void ggml_cuda_flash_attn_ext_mma_f16_case                           \
-    <DKQ, DV, ncols1, ncols2, VKV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
+    <DKQ, DV, ncols1, ncols2, VKV>(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int32_t * ordered_ids) \
 
 #define DECL_FATTN_MMA_F16_CASE(DKQ, DV, ncols1, ncols2) \
     DECL_FATTN_MMA_F16_CASE_VKV(DKQ, DV, ncols1, ncols2, (DKQ == 576))

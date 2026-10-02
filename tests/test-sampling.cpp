@@ -503,6 +503,27 @@ static void test_speculative_coupling() {
 }
 
 static void test_mtp_adaptive() {
+    for (int maximum : {4, 5}) {
+        for (int minimum = 0; minimum <= maximum; ++minimum) {
+            common_speculative_mtp_adaptive deeper(minimum, maximum);
+            const int floor = std::max(2, minimum);
+            for (int i = 0; i < 64; ++i) deeper.accept(maximum, maximum, false);
+            GGML_ASSERT(deeper.depth() == maximum);
+            for (int i = 0; i < 16; ++i) deeper.accept(maximum, 0, false);
+            GGML_ASSERT(deeper.depth() == floor);
+            deeper.begin();
+            for (int i = 0; i < 8; ++i) deeper.accept(floor, floor, false);
+            GGML_ASSERT(deeper.depth() == maximum);
+            for (int i = 0; i < 16; ++i) deeper.accept(maximum, floor, false);
+            for (int i = 0; i < 255; ++i) {
+                deeper.begin(); // short requests must not postpone recovery
+                deeper.accept(floor, 0, false);
+            }
+            GGML_ASSERT(deeper.depth() == floor);
+            deeper.accept(floor, 0, false);
+            GGML_ASSERT(deeper.depth() == maximum);
+        }
+    }
     common_speculative_mtp_adaptive state;
     auto cycles = [&](int n, int accepted) {
         for (int i = 0; i < n; ++i) {

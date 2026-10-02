@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-meta-step-cache.h"
 #include "ggml-alloc.h"
 #include "ggml-cpp.h"
 
@@ -1959,6 +1960,7 @@ struct ggml_backend_meta_context {
         std::vector<void *>   steps;              // one per backend
         std::vector<uint64_t> epochs;             // per backend, at capture
         int64_t               last_used = 0;
+        size_t                nodes = 0;          // original GGML graph size, for retention budgeting
     };
     std::vector<step_record> step_records;
     ggml_backend_meta_thread_pool pool; // per-device launch/issue workers
@@ -1986,7 +1988,7 @@ struct ggml_backend_meta_context {
     void step_record_add(step_record rec) {
         // Bound successful and failed captures alike. Invalid overrides keep
         // the default; zero must not try to evict from an empty cache.
-        static const size_t max_records = []() -> size_t {
+        static const size_t records_override = []() -> size_t {
             if (const char * value = getenv("GGML_META_STEP_RECORDS")) {
                 size_t parsed = 0;
                 const char * end = value + strlen(value);
@@ -1994,11 +1996,15 @@ struct ggml_backend_meta_context {
                 if (result.ec == std::errc{} && result.ptr == end && parsed > 0) {
                     return parsed;
                 }
-                GGML_LOG_WARN("invalid GGML_META_STEP_RECORDS value '%s'; using 16\n", value);
+                GGML_LOG_WARN("invalid GGML_META_STEP_RECORDS value '%s'; using automatic budget\n", value);
             }
-            return 16;
+            return 0;
         }();
-        if (step_records.size() >= max_records) {
+        size_t nodes = rec.nodes;
+        for (const auto & existing : step_records) {
+            nodes += existing.nodes;
+        }
+        while (ggml_backend_meta_step_cache_over_budget(step_records.size() + 1, nodes, records_override)) {
             auto oldest = std::min_element(step_records.begin(), step_records.end(),
                     [](const step_record & a, const step_record & b) { return a.last_used < b.last_used; });
             for (size_t j = 0; j < oldest->steps.size(); j++) {
@@ -2006,6 +2012,7 @@ struct ggml_backend_meta_context {
                     step_free(backend_configs[j].backend, oldest->steps[j]);
                 }
             }
+            nodes -= oldest->nodes;
             step_records.erase(oldest);
         }
         rec.last_used = ggml_time_us();
@@ -2213,7 +2220,7 @@ static uint64_t ggml_backend_meta_graph_signature(const ggml_cgraph * cgraph) {
             mix(&data, sizeof(data));
         }
     };
-    auto mix_tensor = [&](const ggml_tensor * t) {
+    auto mix_descriptor = [&](const ggml_tensor * t) {
         const int32_t type = t->type;
         const int32_t op   = t->op;
         mix_storage(t);
@@ -2225,8 +2232,18 @@ static uint64_t ggml_backend_meta_graph_signature(const ggml_cgraph * cgraph) {
         mix(&t->flags, sizeof(t->flags));
         mix_storage(t->view_src);
         mix(&t->view_offs, sizeof(t->view_offs));
+    };
+    auto mix_tensor = [&](const ggml_tensor * t) {
+        mix_descriptor(t);
         for (int k = 0; k < GGML_MAX_SRC; k++) {
-            mix_storage(t->src[k]);
+            // Scheduler subgraphs need not list their inputs as leaves. A
+            // weight staging address can recur with a different quantization
+            // type or layout; addresses alone must not select its old kernel.
+            if (t->src[k]) {
+                mix_descriptor(t->src[k]);
+            } else {
+                mix_storage(nullptr);
+            }
         }
     };
     mix(&cgraph->n_nodes, sizeof(cgraph->n_nodes));
@@ -3062,11 +3079,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (capture_ok) {
                     // keep the recent shapes (decode at each KV size, prefill chunks, batches with a slot
                     // missing all alternate in a server); evict the least recently used
-                    // GGML_META_STEP_RECORDS raises the cap: a busy server with many slot-occupancy /
-                    // KV-extent shape variants churns 16 (each re-record = a slow uncaptured step + capture)
                     ggml_backend_meta_context::step_record rec;
                     rec.sig   = step_sig;
                     rec.valid = true;
+                    rec.nodes = cgraph->n_nodes;
                     rec.steps = steps;
                     rec.epochs.resize(n_backends);
                     for (size_t j = 0; j < n_backends; j++) {
@@ -3074,8 +3090,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                     backend_ctx->step_record_add(std::move(rec));
                     if (getenv("GGML_META_DEBUG") != nullptr) {
-                        fprintf(stderr, "ggml_backend_meta: recorded step graph for signature %016" PRIx64 " (%zu subgraphs x %zu devices, %zu records)\n",
-                                step_sig, backend_ctx->n_subgraphs, n_backends, backend_ctx->step_records.size());
+                        fprintf(stderr, "ggml_backend_meta: recorded step graph for signature %016" PRIx64 " (%zu subgraphs x %zu devices, %zu records, %d GGML nodes)\n",
+                                step_sig, backend_ctx->n_subgraphs, n_backends, backend_ctx->step_records.size(), cgraph->n_nodes);
                     }
                     // capture recorded the work without executing it: run this compute via replay
                     if (launch_steps(steps)) {

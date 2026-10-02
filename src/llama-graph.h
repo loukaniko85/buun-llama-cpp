@@ -31,8 +31,19 @@ struct llama_hadamard_transform {
     int64_t perm_hd  = 0;
     int64_t perm_nk  = 0;
     int64_t perm_rep = 0;
+    // lowbitflash.rot partitions a weight's input axis into unequal blocks.
+    // Signs are per weight, while the normalized Hadamard matrices are shared.
+    struct segment {
+        ggml_tensor * rot;
+        ggml_tensor * signs;
+        int64_t offset;
+    };
+    std::vector<segment> segments;
 };
 using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
+
+ggml_tensor * llama_hadamard_segments_apply(ggml_context * ctx, ggml_tensor * input,
+                                          const llama_hadamard_transform & transform);
 
 struct llama_cparams;
 struct llama_prec_policy;
@@ -1168,6 +1179,7 @@ struct llm_graph_context {
     // Share only within this graph, with the complete transform in the key.
     using hadamard_input_key = std::tuple<ggml_tensor *, ggml_tensor *, ggml_tensor *, int64_t, int64_t, int64_t>;
     mutable std::map<hadamard_input_key, ggml_tensor *> hadamard_inputs;
+    mutable std::map<std::pair<ggml_tensor *, ggml_tensor *>, ggml_tensor *> segmented_inputs;
 
     // DDTree: tree-mode SSM buffers
     ggml_tensor * tree_parent_ids = nullptr;
@@ -1394,7 +1406,8 @@ struct llm_graph_context {
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v] // TODO: remove
                   float   kq_scale,
                     int   il,
-            ggml_tensor * wo_in_s = nullptr) const;
+            ggml_tensor * wo_in_s = nullptr,
+                   bool   kv_only = false) const;
 
     llm_graph_input_attn_k  * build_attn_inp_k() const;
 

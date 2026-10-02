@@ -45,7 +45,8 @@ __device__ __forceinline__ float fwht_load<half>(const half value) {
 template <int N, typename T, bool has_signs>
 __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
 __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, const float scale,
-                          const float * signs, const int n_blk) {
+                          const float * signs, const int n_blk, const int src_blocks,
+                          const int64_t src_row_stride) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
@@ -54,7 +55,8 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
         return;
     }
 
-    src += r * N;
+    src += src_row_stride == int64_t(src_blocks) * N ? r * N :
+        (r / src_blocks) * src_row_stride + (r % src_blocks) * N;
     dst += r * N;
 
     static constexpr int el_w = N / warp_size;
@@ -87,7 +89,8 @@ __global__ void fwht_cuda(const T * src, float * dst, const int64_t n_rows, cons
 template <typename T>
 static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float * dst_d,
                         const int n, const int64_t rows, const float scale,
-                        const float * signs, const int n_blk) {
+                        const float * signs, const int n_blk, const int src_blocks,
+                        const int64_t src_row_stride) {
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int rows_per_block = 4;
     const int64_t num_blocks = (rows + rows_per_block - 1) / rows_per_block;
@@ -101,9 +104,9 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
 #define FWHT_CASE(NN) \
         case NN: \
             if (signs) { \
-                ggml_cuda_kernel_launch(fwht_cuda<NN, T, true>,  launch_params, src_d, dst_d, rows, scale, signs, n_blk); \
+                ggml_cuda_kernel_launch(fwht_cuda<NN, T, true>,  launch_params, src_d, dst_d, rows, scale, signs, n_blk, src_blocks, src_row_stride); \
             } else { \
-                ggml_cuda_kernel_launch(fwht_cuda<NN, T, false>, launch_params, src_d, dst_d, rows, scale, nullptr, 1); \
+                ggml_cuda_kernel_launch(fwht_cuda<NN, T, false>, launch_params, src_d, dst_d, rows, scale, nullptr, 1, src_blocks, src_row_stride); \
             } \
             return true;
         FWHT_CASE(64)
@@ -121,11 +124,21 @@ static bool fwht_launch(ggml_backend_cuda_context & ctx, const T * src_d, float 
 static bool fwht_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst,
                           const ggml_tensor * signs_t) {
     GGML_ASSERT(ggml_nelements(src) == ggml_nelements(dst));
-    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+    // Segment views have contiguous elements but skip the other segments
+    // between rows. Higher-dimensional strided layouts keep the fallback.
+    if ((!ggml_is_contiguous(src) &&
+            (src->ne[2] != 1 || src->ne[3] != 1 || src->nb[0] != ggml_type_size(src->type))) ||
+        !ggml_is_contiguous(dst)) {
         return false;
     }
     const int     n    = dst->ne[0];
     const int64_t rows = ggml_nelements(dst) / n;
+
+    if (src->ne[0] % n != 0) {
+        return false;
+    }
+    const int src_blocks = src->ne[0] / n;
+    const int64_t src_row_stride = src->nb[1] / ggml_type_size(src->type);
 
     if ((src->type != GGML_TYPE_F32 && src->type != GGML_TYPE_F16) || dst->type != GGML_TYPE_F32) {
         return false;
@@ -145,9 +158,11 @@ static bool fwht_dispatch(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     const float scale = 1 / sqrtf(n);
 
     if (src->type == GGML_TYPE_F32) {
-        return fwht_launch<float>(ctx, (const float *) src->data, dst_d, n, rows, scale, signs, n_blk);
+        return fwht_launch<float>(ctx, (const float *) src->data, dst_d, n, rows, scale, signs, n_blk,
+                                  src_blocks, src_row_stride);
     }
-    return fwht_launch<half>(ctx, (const half *) src->data, dst_d, n, rows, scale, signs, n_blk);
+    return fwht_launch<half>(ctx, (const half *) src->data, dst_d, n, rows, scale, signs, n_blk,
+                             src_blocks, src_row_stride);
 }
 
 bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst) {
@@ -158,6 +173,75 @@ bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
 bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
                               const ggml_tensor * signs, ggml_tensor * dst) {
     return fwht_dispatch(ctx, src, dst, signs);
+}
+
+struct fwht_segments_args {
+    const float * src[3];
+    const float * signs[3];
+    int64_t stride[3];
+    int64_t rows;
+};
+
+template<int N>
+static __device__ __forceinline__ void fwht_segment_store(const float * src, const float * signs, float * dst) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    float reg[N / warp_size];
+    const int lane = threadIdx.x;
+    const float scale = 1.0f / sqrtf(float(N));
+#pragma unroll
+    for (int j = 0; j < N / warp_size; ++j) reg[j] = (src[j*warp_size+lane] * signs[j*warp_size+lane]) * scale;
+    fwht_registers<N>(reg, lane);
+#pragma unroll
+    for (int j = 0; j < N / warp_size; ++j) dst[j*warp_size+lane] = reg[j];
+}
+
+template<int segments>
+__launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void fwht_segments_cuda(fwht_segments_args args, float * dst) {
+    const int64_t group = int64_t(blockIdx.x)*4 + threadIdx.y;
+    const int64_t row = group / segments;
+    const int segment = group % segments;
+    if (row >= args.rows) return;
+    const float * src = args.src[segment] + row*args.stride[segment];
+    const float * signs = args.signs[segment];
+    ggml_cuda_pdl_sync();
+    if constexpr (segments == 3) {
+        dst += row*2560 + segment*1024;
+        if (segment < 2) fwht_segment_store<1024>(src, signs, dst);
+        else fwht_segment_store<512>(src, signs, dst);
+    } else {
+        dst += row*640 + segment*512;
+        if (segment == 0) fwht_segment_store<512>(src, signs, dst);
+        else fwht_segment_store<128>(src, signs, dst);
+    }
+}
+
+bool ggml_cuda_op_fwht_segments(ggml_backend_cuda_context & ctx,
+                                const ggml_tensor * const * transforms, int count, ggml_tensor * dst) {
+    if ((count != 2 && count != 3) || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
+            dst->ne[2] != 1 || dst->ne[3] != 1 || dst->ne[0] != (count == 3 ? 2560 : 640)) return false;
+    fwht_segments_args args{};
+    args.rows = dst->ne[1];
+    for (int i = 0; i < count; ++i) {
+        const auto * mm = transforms[i];
+        const auto * mul = mm->src[1];
+        const auto * src = mul->src[0];
+        const auto * signs = mul->src[1];
+        const int width = count == 3 ? (i < 2 ? 1024 : 512) : (i == 0 ? 512 : 128);
+        if (ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD ||
+                mul->type != GGML_TYPE_F32 || src->type != GGML_TYPE_F32 || signs->type != GGML_TYPE_F32 ||
+                !ggml_are_same_shape(src, mm) || src->ne[0] != width || src->ne[1] != args.rows ||
+                src->ne[2] != 1 || src->ne[3] != 1 || src->nb[0] != sizeof(float) ||
+                signs->ne[0] != width || ggml_nelements(signs) != width || !ggml_is_contiguous(signs)) return false;
+        args.src[i] = (const float *) src->data;
+        args.signs[i] = (const float *) signs->data;
+        args.stride[i] = src->nb[1] / sizeof(float);
+    }
+    const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const ggml_cuda_kernel_launch_params params(dim3((args.rows*count+3)/4), dim3(warp_size,4), 0, ctx.stream());
+    if (count == 3) ggml_cuda_kernel_launch(fwht_segments_cuda<3>, params, args, (float *) dst->data);
+    else ggml_cuda_kernel_launch(fwht_segments_cuda<2>, params, args, (float *) dst->data);
+    return true;
 }
 
 // A CTA cooperates on one 1024-element group. Unlike the ordinary FWHT,

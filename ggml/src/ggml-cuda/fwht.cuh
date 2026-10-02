@@ -6,6 +6,8 @@ bool ggml_cuda_op_mul_mat_use_fwht(const struct ggml_tensor * op);
 bool ggml_cuda_op_fwht(ggml_backend_cuda_context & ctx, const ggml_tensor * src, ggml_tensor * dst);
 bool ggml_cuda_op_fwht_signed(ggml_backend_cuda_context & ctx, const ggml_tensor * src,
                               const ggml_tensor * signs, ggml_tensor * dst);
+bool ggml_cuda_op_fwht_segments(ggml_backend_cuda_context & ctx,
+                                const ggml_tensor * const * transforms, int count, ggml_tensor * dst);
 
 // Bonsai's 1024-wide transform, directly into the MMVQ activation layout.
 void ggml_cuda_fwht_q8_1(ggml_backend_cuda_context & ctx, const ggml_tensor * src,

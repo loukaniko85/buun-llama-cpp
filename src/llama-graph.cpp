@@ -1,8 +1,10 @@
 #include "llama-graph.h"
 
 #include "ggml-turbo-meansub.h"
+#include "../ggml/src/ggml-backend-moe-cache.h"
 #include "llama-impl.h"
 #include "llama-model.h"
+#include "llama-moe-routing.h"
 #include "llama-batch.h"
 #include "llama-context.h"
 #include "llama-cparams.h"
@@ -1885,6 +1887,29 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+// Contract: W_rot = W blockdiag(D H), so the activation must be blockdiag(H D) x.
+// Keep each segment explicit so existing CPU/GPU Hadamard dispatch remains usable.
+ggml_tensor * llama_hadamard_segments_apply(ggml_context * ctx, ggml_tensor * input,
+                                          const llama_hadamard_transform & transform) {
+    GGML_ASSERT(!transform.segments.empty());
+    const auto & last = transform.segments.back();
+    GGML_ASSERT(last.offset + last.rot->ne[0] == input->ne[0]);
+    ggml_tensor * flat = ggml_is_contiguous(input)
+        ? ggml_reshape_2d(ctx, input, input->ne[0], ggml_nrows(input))
+        : ggml_cont_2d(ctx, input, input->ne[0], ggml_nrows(input));
+    ggml_tensor * result = nullptr;
+    for (const auto & segment : transform.segments) {
+        const int64_t width = segment.rot->ne[0];
+        ggml_tensor * part = ggml_view_2d(ctx, flat, width, flat->ne[1], flat->nb[1],
+                                        segment.offset * flat->nb[0]);
+        part = ggml_mul(ctx, part, segment.signs);
+        part = ggml_mul_mat(ctx, segment.rot, part);
+        ggml_mul_mat_set_hint(part, GGML_HINT_SRC0_IS_HADAMARD);
+        result = result ? ggml_concat(ctx, result, part, 0) : part;
+    }
+    return ggml_reshape_4d(ctx, result, input->ne[0], input->ne[1], input->ne[2], input->ne[3]);
+}
+
 ggml_tensor * llm_graph_context::build_hadamard_input(ggml_tensor * w, ggml_tensor * cur) const {
     if (!hadamard_rotations || hadamard_rotations->empty()) {
         return cur;
@@ -1894,6 +1919,16 @@ ggml_tensor * llm_graph_context::build_hadamard_input(ggml_tensor * w, ggml_tens
         return cur;
     }
     const auto & t = it->second;
+    if (!t.segments.empty()) {
+        const auto key = std::make_pair(cur, w);
+        const auto cached = segmented_inputs.find(key);
+        if (cached != segmented_inputs.end()) {
+            return cached->second;
+        }
+        auto * rotated = llama_hadamard_segments_apply(ctx0, cur, t);
+        segmented_inputs.emplace(key, rotated);
+        return rotated;
+    }
     const hadamard_input_key key { cur, t.rot, t.signs, t.perm_hd, t.perm_nk, t.perm_rep };
     const auto cached = hadamard_inputs.find(key);
     if (cached != hadamard_inputs.end()) {
@@ -2663,6 +2698,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
+
+    // Keep top-k and weight normalization adjacent for backend fusion, then
+    // pack the narrow routing view before expert offload downloads it. This
+    // uses the ordinary CONT operation rather than backend-specific transfers.
+    if (llama_moe_ids_need_compaction(selected_experts, n_tokens,
+            ggml_backend_sched_has_moe_cache(sched), { up_exps, gate_exps, down_exps, gate_up_exps })) {
+        selected_experts = ggml_cont(ctx0, selected_experts);
+        cb(selected_experts, "ffn_moe_topk_cont", il);
+    }
 
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -3436,11 +3480,14 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * v_mla, // TODO: remove
             float     kq_scale,
             int       il,
-        ggml_tensor * wo_in_s) const {
+        ggml_tensor * wo_in_s,
+               bool   kv_only) const {
     GGML_ASSERT(v_mla == nullptr);
 
     if (inp->self_k_rot) {
-        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
+        if (!kv_only) {
+            q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
+        }
         k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
     }
 
@@ -3451,7 +3498,9 @@ ggml_tensor * llm_graph_context::build_attn(
     // these nodes are added to the graph together so that they are not reordered
     // by doing so, the number of splits in the graph is reduced
     // expand k later to enable rope fusion which directly writes into k-v cache
-    ggml_build_forward_expand(gf, q_cur);
+    if (!kv_only) {
+        ggml_build_forward_expand(gf, q_cur);
+    }
     ggml_build_forward_expand(gf, v_cur);
     ggml_build_forward_expand(gf, k_cur);
 
@@ -3464,6 +3513,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+    }
+
+    if (kv_only) {
+        return nullptr;
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();

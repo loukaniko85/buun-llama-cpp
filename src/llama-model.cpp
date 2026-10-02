@@ -1646,6 +1646,57 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         }
     }
 
+    // Mooney's per-weight segmented folds use the same activation-transform
+    // machinery as prism.hadamard, but not its per-width sign convention.
+    uint32_t segmented_version = 0;
+    if (ml.get_key("lowbitflash.rot.version", segmented_version, false)) {
+        if (segmented_version != 1 || arch != LLM_ARCH_QWEN4EXP) {
+            throw std::runtime_error("unsupported lowbitflash.rot version or model architecture");
+        }
+        std::vector<std::string> names, inverse_names;
+        ml.get_arr("lowbitflash.rot.weight_names", names);
+        if (gguf_find_key(ctx, "lowbitflash.rot.inverse_names") >= 0) {
+            ml.get_arr("lowbitflash.rot.inverse_names", inverse_names);
+        }
+        // Initial coverage is the three routed expert projections in Mooney.
+        // Reject other folds explicitly instead of loading untransformed bytes.
+        if (names.empty() || !inverse_names.empty()) {
+            throw std::runtime_error("lowbitflash.rot requires expert weights and no inverse lookup folds");
+        }
+        for (const auto & weight_name : names) {
+            size_t pos = 4;
+            while (pos < weight_name.size() && isdigit((unsigned char) weight_name[pos])) {
+                ++pos;
+            }
+            const std::string suffix = weight_name.substr(std::min(pos, weight_name.size()));
+            if (weight_name.compare(0, 4, "blk.") != 0 || pos == 4 ||
+                    (suffix != ".ffn_up_exps.weight" && suffix != ".ffn_gate_exps.weight" &&
+                     suffix != ".ffn_down_exps.weight")) {
+                throw std::runtime_error(format("unsupported lowbitflash.rot weight: %s", weight_name.c_str()));
+            }
+            if (hadamard_weight_blocks.count(weight_name) || hadamard_inverse_blocks.count(weight_name)) {
+                throw std::runtime_error(format("duplicate rotation metadata for %s", weight_name.c_str()));
+            }
+            segmented_rotation_spec spec;
+            ml.get_arr("lowbitflash.rot.blocks." + weight_name, spec.blocks);
+            ml.get_arr("lowbitflash.rot.signs." + weight_name, spec.signs);
+            int64_t width = 0;
+            for (int32_t block : spec.blocks) {
+                if (block < 128 || block > 8192 || (block & (block - 1))) {
+                    throw std::runtime_error(format("invalid lowbitflash.rot block for %s", weight_name.c_str()));
+                }
+                width += block;
+            }
+            if (!width || size_t(width) != spec.signs.size() ||
+                    std::any_of(spec.signs.begin(), spec.signs.end(), [](int32_t sign) { return sign != -1 && sign != 1; })) {
+                throw std::runtime_error(format("invalid lowbitflash.rot signs for %s", weight_name.c_str()));
+            }
+            if (!segmented_rotation_specs.emplace(weight_name, std::move(spec)).second) {
+                throw std::runtime_error(format("duplicate lowbitflash.rot weight: %s", weight_name.c_str()));
+            }
+        }
+    }
+
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
 
@@ -2528,7 +2579,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // Mapped weights acquire their tensor buffers during load_all_data above.
     // Dry loads already have dummy buffers and must also build the transforms.
-    if (!hadamard_weight_blocks.empty() || !hadamard_inverse_blocks.empty()) {
+    if (!hadamard_weight_blocks.empty() || !hadamard_inverse_blocks.empty() || !segmented_rotation_specs.empty()) {
         struct hadamard_rotation {
             uint32_t block_size;
             ggml_backend_buffer_type_t buft;
@@ -2573,6 +2624,66 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             return tensor;
         };
 
+        const auto get_rotation = [&](uint32_t block_size, ggml_backend_buffer_type_t buft) {
+            for (const auto & rotation : rotations) {
+                if (rotation.block_size == block_size && rotation.buft == buft) {
+                    return rotation.tensor;
+                }
+            }
+            auto * rotation = new_transform(buft, block_size, block_size, format("hadamard.%u", block_size));
+            if (!ml.no_alloc) {
+                std::vector<float> data(size_t(block_size) * block_size);
+                const float scale = 1.0f / sqrtf(float(block_size));
+                for (uint32_t row = 0; row < block_size; ++row) {
+                    for (uint32_t col = 0; col < block_size; ++col) {
+                        uint32_t parity = row & col;
+                        parity ^= parity >> 16;
+                        parity ^= parity >> 8;
+                        parity ^= parity >> 4;
+                        parity ^= parity >> 2;
+                        parity ^= parity >> 1;
+                        data[size_t(row) * block_size + col] = (parity & 1) ? -scale : scale;
+                    }
+                }
+                ggml_backend_tensor_set(rotation, data.data(), 0, data.size() * sizeof(float));
+            }
+            rotations.push_back({ block_size, buft, rotation });
+            return rotation;
+        };
+
+        for (const auto & [weight_name, spec] : segmented_rotation_specs) {
+            // Target-only loads deliberately omit an embedded MTP block.
+            // Only the loader may exempt a weight; unknown names still fail.
+            if (ml.skipped_tensors.count(weight_name)) {
+                continue;
+            }
+            const auto * weight = get_tensor(weight_name.c_str());
+            if (!weight || !weight->buffer || weight->ne[0] != int64_t(spec.signs.size())) {
+                throw std::runtime_error(format("lowbitflash.rot weight geometry mismatch: %s", weight_name.c_str()));
+            }
+            // Experts may live in RAM, but their activation transform belongs
+            // with the layer's dense compute. This also keeps cache hits on GPU.
+            const size_t dot = weight_name.find('.', 4);
+            const int layer = std::stoi(weight_name.substr(4, dot - 4));
+            if (layer < 0 || size_t(layer) >= layers.size()) {
+                throw std::runtime_error("lowbitflash.rot layer out of range");
+            }
+            const auto buft = ggml_backend_dev_buffer_type(dev_layer(layer));
+            llama_hadamard_transform transform {};
+            int64_t offset = 0;
+            for (int32_t block : spec.blocks) {
+                auto * rotation = get_rotation(block, buft);
+                auto * signs = new_transform(buft, block, 1, format("lbf.signs.%s.%lld", weight_name.c_str(), (long long) offset));
+                if (!ml.no_alloc) {
+                    std::vector<float> data(spec.signs.begin() + offset, spec.signs.begin() + offset + block);
+                    ggml_backend_tensor_set(signs, data.data(), 0, data.size() * sizeof(float));
+                }
+                transform.segments.push_back({ rotation, signs, offset });
+                offset += block;
+            }
+            hadamard_rotations.emplace(weight, std::move(transform));
+        }
+
         for (const auto & [blocks, target] : groups)
         for (const auto & entry : *blocks) {
             const std::string & weight_name = entry.first;
@@ -2594,33 +2705,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (target == &hadamard_inverses) {
                 buft = inverse_buft;
             }
-            auto it = std::find_if(rotations.begin(), rotations.end(),
-                    [block_size, buft](const hadamard_rotation & rotation) {
-                        return rotation.block_size == block_size && rotation.buft == buft;
-                    });
-
-            if (it == rotations.end()) {
-                ggml_tensor * rotation = new_transform(buft, block_size, block_size,
-                        format("prism.hadamard.%u", block_size));
-                if (!ml.no_alloc) {
-                    std::vector<float> data((size_t) block_size * block_size);
-                    const float scale = 1.0f / sqrtf((float) block_size);
-                    for (uint32_t row = 0; row < block_size; ++row) {
-                        for (uint32_t col = 0; col < block_size; ++col) {
-                            uint32_t parity = row & col;
-                            parity ^= parity >> 16;
-                            parity ^= parity >> 8;
-                            parity ^= parity >> 4;
-                            parity ^= parity >> 2;
-                            parity ^= parity >> 1;
-                            data[(size_t) row * block_size + col] = (parity & 1) ? -scale : scale;
-                        }
-                    }
-                    ggml_backend_tensor_set(rotation, data.data(), 0, data.size() * sizeof(float));
-                }
-                rotations.push_back({ block_size, buft, rotation });
-                it = std::prev(rotations.end());
-            }
+            ggml_tensor * rotation = get_rotation(block_size, buft);
 
             ggml_tensor * sign_tensor = nullptr;
             if (!hadamard_sign_data.empty()) {
@@ -2643,7 +2728,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 sign_tensor = st->second;
             }
 
-            llama_hadamard_transform transform { it->tensor, sign_tensor };
+            llama_hadamard_transform transform { rotation, sign_tensor };
             if (hadamard_gdn_v_grouped && weight_name.find(".ssm_out.") != std::string::npos) {
                 const int64_t n_v = hparams.ssm_dt_rank;
                 const int64_t n_k = hparams.ssm_n_group;

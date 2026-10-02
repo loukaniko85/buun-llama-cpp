@@ -15,7 +15,7 @@ static inline size_t ggml_moe_cache_effective_min_expert_bytes(
     // Q2_0 stores twice as many weights per byte as Q4_0. A 450 KiB
     // Q2_0 expert should not miss the ordinary 512 KiB floor merely because
     // its codes are more compact; retain the same minimum weight count.
-    if (wtype == GGML_TYPE_Q2_0) return default_minimum / 2;
+    if (wtype == GGML_TYPE_Q2_0 || wtype == GGML_TYPE_Q2_0_G128) return default_minimum / 2;
     return default_minimum;
 }
 
@@ -117,6 +117,30 @@ struct ggml_moe_cache_api {
     int (*prefill_copy)(void * session, void * backend, const struct ggml_tensor * source,
             struct ggml_tensor * destination, const uint32_t * selected, size_t n_words);
 
+    // One-projection lookahead. The scheduler reserves destination lifetime
+    // before begin; end drains source reads on every success/failure/abort path.
+    // supported is allocation-independent. A null begin leaves ordinary copying
+    // responsible for the input; a failed end requires the same fallback.
+    // Jobs are thread-affine and end must run on the thread that called begin.
+    int (*prefetch_supported)(void * backend, const struct ggml_tensor * source);
+    // Optional ready-route bitmap, consumed during begin (not retained by job).
+    // Null selects every expert; selected runs include the MMQ read padding.
+    void * (*prefetch_begin)(void * session, void * backend,
+            const struct ggml_tensor * source, struct ggml_tensor * destination,
+            const uint32_t * selected, size_t selected_words);
+    int (*prefetch_end)(void * job);
+
+    // Closed CPU-output -> device-copy handoff for this scheduler evaluation.
+    // The scheduler reserves destination before the CPU producer and drains
+    // earlier device reads before bind. copy runs after CPU completion, uploads
+    // misses, and consumes the binding. Zero uses the ordinary copy, positive
+    // means consumed, and negative reports a failed deferred collection.
+    int (*output_supported)(void * backend, const struct ggml_tensor * source);
+    int (*output_bind)(void * session, void * backend, const struct ggml_tensor * source,
+            struct ggml_tensor * destination);
+    int (*output_copy)(void * session, void * backend, const struct ggml_tensor * source,
+            struct ggml_tensor * destination);
+
     // Begin one CPU MUL_MAT_ID node. Returns an opaque plan, or NULL when the stock CPU path should handle the complete node.
     void * (*begin)(const char * tensor_name, const void * host_base, size_t expert_size,
                     int64_t n_in, int64_t n_out, int wtype, int64_t n_expert,
@@ -161,6 +185,9 @@ GGML_API void ggml_moe_cache_unregister(const void * owner);
 GGML_API void ggml_backend_sched_set_moe_cache(
         ggml_backend_sched_t sched, enum ggml_moe_cache_mode mode,
         size_t budget_mib, int expert_parallel, int cpu_overlap, const char * profile_path);
+// Resolved provider admission, including no_alloc graph reservation. A session
+// does not imply that any particular expert is currently resident.
+GGML_API bool ggml_backend_sched_has_moe_cache(ggml_backend_sched_t sched);
 
 #ifdef __cplusplus
 }

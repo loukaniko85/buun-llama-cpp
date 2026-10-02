@@ -84,7 +84,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
         GGML_ASSERT(sis1 > 0);
 
-        ggml_cuda_launch_mm_ids_helper(ids_d, ids_src_compact_dev.get(), ids_dst_compact_dev.get(), expert_bounds_dev.get(),
+        ggml_cuda_launch_mm_ids_helper(ctx.pool(), ids_d, ids_src_compact_dev.get(), ids_dst_compact_dev.get(), expert_bounds_dev.get(),
             static_cast<int>(n_experts), static_cast<int>(n_tokens), static_cast<int>(n_expert_used), static_cast<int>(ne11), si1, sis1, /*write_inverse =*/ false, ctx.stream());
         CUDA_CHECK(cudaGetLastError());
 
@@ -121,9 +121,11 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             const nv_bfloat162 * src0_d = (const nv_bfloat162 *) src0->data;
             constexpr int vals_per_T = 2;
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-            // A narrow HC projection underfills Blackwell with 32 output rows
-            // per block. Halve the row tile without changing the dot reduction.
-            if (!ids && cc == GGML_CUDA_CC_BLACKWELL && blackwell_mma_available(cc) &&
+            // A narrow HC projection underfills SM86 and Blackwell with 32 output
+            // rows per block. Halve the tile without changing the dot reduction.
+            const bool narrow_hc = (cc == 860 && ampere_mma_available(cc)) ||
+                                   (cc == GGML_CUDA_CC_BLACKWELL && blackwell_mma_available(cc));
+            if (!ids && narrow_hc &&
                     ne00 == 10240 && ne01 == 320 && ne02*ne03 == 1 && ne12*ne13 == 1 &&
                     ncols_dst >= 2 && ncols_dst <= 4 &&
                     ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {

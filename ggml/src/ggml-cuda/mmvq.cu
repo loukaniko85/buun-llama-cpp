@@ -2212,6 +2212,22 @@ static void mul_mat_vec_q_moe_cache_launch(
 
     constexpr int rows_per_block = 2;
     const int device = ggml_cuda_get_device();
+    if constexpr (type == GGML_TYPE_Q2_0_G128 && !has_fusion) {
+        // Mooney's short projections benefit from more rows per warp and
+        // two independent hits per CTA. Other shapes retain their tuning.
+        if (ggml_cuda_info().devices[device].cc == 860 &&
+                ((ncols_x == 2560 && nrows_x == 640) || (ncols_x == 640 && nrows_x == 2560))) {
+            const ggml_cuda_kernel_launch_params params(
+                dim3((nrows_x + 3) / 4, (n_hits + 1) / 2), dim3(warp_size, 2), 0, stream);
+            ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, 4, false, false, true>, params,
+                vx, vy, ids, act_ids, gate, gate_ids, ggml_cuda_mmvq_fusion_args_device{}, dst,
+                ncols_x, nchannels_y, nrows_x, stride_row_x, 0, 0,
+                stride_channel_x, stride_channel_y, stride_channel_dst,
+                n_hits, n_hits, up_min, up_max, gate_min, gate_max);
+            ggml_cuda_moe_cache_flat_hits_record(ggml_cuda_moe_cache_flat_hits_path::factor_2);
+            return;
+        }
+    }
     const auto flat_hits = ggml_cuda_select_moe_cache_flat_hits(
         ggml_cuda_info().devices[device].cc, type, n_hits);
     if (flat_hits.path == ggml_cuda_moe_cache_flat_hits_path::factor_1) {
@@ -2994,6 +3010,7 @@ ggml_cuda_moe_cache_mmv_path ggml_cuda_moe_cache_mmv(
     switch (type0) {
         MOE_CACHE_MMV_CASE(GGML_TYPE_Q1_0);
         MOE_CACHE_MMV_CASE(GGML_TYPE_Q2_0);
+        MOE_CACHE_MMV_CASE(GGML_TYPE_Q2_0_G128);
         MOE_CACHE_MMV_CASE(GGML_TYPE_Q4_0);
         MOE_CACHE_MMV_CASE(GGML_TYPE_Q4_1);
         MOE_CACHE_MMV_CASE(GGML_TYPE_Q5_0);
@@ -3082,6 +3099,7 @@ void ggml_cuda_moe_cache_mmv_fused(
     switch (type0) {
         MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q1_0);
         MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q2_0);
+        MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q2_0_G128);
         MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q4_0);
         MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q4_1);
         MOE_CACHE_MMV_FUSED_CASE(GGML_TYPE_Q5_0);

@@ -561,6 +561,8 @@ struct ggml_threadpool {
     uint32_t     poll;        // Polling level (0 - no polling)
 
     enum ggml_status ec;
+    // Only the caller/thread 0 accesses this; published before launching workers.
+    bool moe_preplanned;
 };
 
 // Per-thread state
@@ -2298,7 +2300,7 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
-#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#if defined(__AVX2__)
     // Amortize activation preparation over at least one output-column tile.
     const bool prepare_q2 = ne00 <= 16384 && ir0_end - ir0_start >= 16;
     if (type == GGML_TYPE_Q2_0 && (prepare_q2 || ir1_end - ir1_start > 1)) {
@@ -4398,6 +4400,128 @@ static bool ggml_moe_cache_data_overlaps(const struct ggml_tensor * a, const str
     return ap >= bp ? ap - bp < ggml_nbytes(b) : bp - ap < ggml_nbytes(a);
 }
 
+static void ggml_moe_cache_prepare_fusion(
+        const struct ggml_moe_cache_fusion * fusion,
+        struct ggml_tensor * down,
+        struct moe_cache_fused_state * state) {
+    struct ggml_tensor * glu = fusion->glu;
+    const struct ggml_tensor * up_weight = fusion->up->src[0];
+    const struct ggml_tensor * gate_weight = fusion->gate->src[0];
+    const struct ggml_tensor * acts = fusion->up->src[1];
+    const struct ggml_tensor * ids = fusion->up->src[2];
+    const int n_ids = (int) ids->ne[0];
+    const int n_tokens = (int) ids->ne[1];
+    const int n_rows = n_ids * n_tokens;
+    memset(state, 0, sizeof(*state));
+    struct ggml_moe_cache_tensor_desc up_desc = {
+        up_weight->name,
+        up_weight->data,
+        up_weight->nb[2],
+        up_weight->ne[0],
+        up_weight->ne[1],
+        up_weight->ne[2],
+        (int32_t)up_weight->type,
+    };
+    struct ggml_moe_cache_tensor_desc gate_desc = {
+        gate_weight->name,
+        gate_weight->data,
+        gate_weight->nb[2],
+        gate_weight->ne[0],
+        gate_weight->ne[1],
+        gate_weight->ne[2],
+        (int32_t)gate_weight->type,
+    };
+    struct ggml_moe_cache_tensor_desc down_desc = { 0 };
+    if (down) {
+        const struct ggml_tensor * down_weight = down->src[0];
+        down_desc = (struct ggml_moe_cache_tensor_desc) {
+            down_weight->name,
+            down_weight->data,
+            down_weight->nb[2],
+            down_weight->ne[0],
+            down_weight->ne[1],
+            down_weight->ne[2],
+            (int32_t)down_weight->type,
+        };
+    }
+    for (int token = 0; token < n_tokens; token++) {
+        for (int id = 0; id < n_ids; id++) {
+            const int row = token*n_ids + id;
+            state->ids[row] = *(const int32_t *)((const char *)ids->data + token*ids->nb[1] + id*ids->nb[0]);
+            state->acts[row] = (const float *)((const char *)acts->data + token*acts->nb[2] + (id % acts->ne[1])*acts->nb[1]);
+        }
+    }
+    // Planning without launching lets the workers start on the misses at once;
+    // thread 0 then dispatches while they compute.
+    state->node = ggml_moe_cache.fused_plan(
+            &up_desc, &gate_desc, down ? &down_desc : NULL,
+            (int)GGML_GLU_OP_SWIGLU,
+            fusion->up_min, fusion->up_max,
+            fusion->gate_min, fusion->gate_max,
+            state->ids, n_rows, n_tokens,
+            state->acts, &state->hit_mask);
+    if (!state->node && down) {
+        state->hit_mask = 0;
+        state->node = ggml_moe_cache.fused_plan(
+                &up_desc, &gate_desc, NULL,
+                (int)GGML_GLU_OP_SWIGLU,
+                fusion->up_min, fusion->up_max,
+                fusion->gate_min, fusion->gate_max,
+                state->ids, n_rows, n_tokens,
+                state->acts, &state->hit_mask);
+    } else if (state->node && down) {
+        state->full = 1;
+    }
+    // Keep this publication immutable until the outer graph barrier: collect()
+    // clears node while other workers may still be entering an all-hit fusion.
+    state->skipped = state->node ? fusion->skipped + state->full : 0;
+    if (state->node) {
+        struct ggml_tensor * output = state->full ? down : glu;
+        state->n_out = output->ne[0];
+        for (int row = 0; row < n_rows; row++) {
+            if (state->hit_mask & (UINT64_C(1) << row)) {
+                state->rows[state->n_hits++] =
+                    (float *)((char *)output->data + row*output->nb[1]);
+            }
+        }
+    }
+}
+
+// Only pre-plan a closed FFN graph. A rejected or mixed plan is consumed by the
+// normal worker path exactly once. An all-GPU plan still uses that same compute
+// path (including its CPU recovery on a failed collect), but needs only thread 0.
+static bool ggml_moe_cache_preplan_graph(struct ggml_threadpool * threadpool) {
+    const struct ggml_cplan * cplan = threadpool->cplan;
+    const struct ggml_cgraph * cgraph = threadpool->cgraph;
+    struct ggml_moe_cache_fusion fusion;
+    if ((cgraph->n_nodes != 4 && cgraph->n_nodes != 6) ||
+        ggml_cpu_disable_fusion || cplan->use_ref || cplan->abort_callback ||
+        !cplan->work_data || cplan->work_size < MOE_CACHE_FUSED_WORK_SIZE ||
+        !ggml_moe_cache_can_fuse(cgraph, 0, &fusion) || !fusion.down ||
+        cgraph->n_nodes != fusion.skipped + 2) {
+        return false;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (!(cgraph->nodes[i]->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            ggml_op_is_empty(cgraph->nodes[i]->op)) {
+            return false;
+        }
+    }
+    const struct ggml_tensor * acts = fusion.up->src[1];
+    if (ggml_moe_cache_data_overlaps(acts, fusion.glu) ||
+        ggml_moe_cache_data_overlaps(acts, fusion.down)) {
+        return false;
+    }
+    struct moe_cache_fused_state * state = (struct moe_cache_fused_state *) cplan->work_data;
+    ggml_moe_cache_prepare_fusion(&fusion, fusion.down, state);
+    threadpool->moe_preplanned = true;
+    const struct ggml_tensor * ids = fusion.up->src[2];
+    const int n_rows = (int) (ids->ne[0] * ids->ne[1]);
+    const uint64_t valid_mask = n_rows == MOE_CACHE_MAX_TOPK
+        ? UINT64_MAX : (UINT64_C(1) << n_rows) - 1;
+    return state->node && state->full && state->hit_mask == valid_mask;
+}
+
 static int ggml_cpu_try_fuse_moe_cache(
         const struct ggml_cgraph * cgraph,
         int node_n,
@@ -4414,8 +4538,6 @@ static int ggml_cpu_try_fuse_moe_cache(
     struct ggml_tensor * down = fusion.down;
     struct moe_cache_fused_state * state =
         (struct moe_cache_fused_state *)params->wdata;
-    const struct ggml_tensor * up_weight = up->src[0];
-    const struct ggml_tensor * gate_weight = gate->src[0];
     const struct ggml_tensor * acts = up->src[1];
     const struct ggml_tensor * ids = up->src[2];
     // Failed GPU collection must still be able to recompute from the original
@@ -4432,79 +4554,10 @@ static int ggml_cpu_try_fuse_moe_cache(
     const int n_rows = n_ids*n_tokens;
 
     if (params->ith == 0) {
-        memset(state, 0, sizeof(*state));
-        struct ggml_moe_cache_tensor_desc up_desc = {
-            up_weight->name,
-            up_weight->data,
-            up_weight->nb[2],
-            up_weight->ne[0],
-            up_weight->ne[1],
-            up_weight->ne[2],
-            (int32_t)up_weight->type,
-        };
-        struct ggml_moe_cache_tensor_desc gate_desc = {
-            gate_weight->name,
-            gate_weight->data,
-            gate_weight->nb[2],
-            gate_weight->ne[0],
-            gate_weight->ne[1],
-            gate_weight->ne[2],
-            (int32_t)gate_weight->type,
-        };
-        struct ggml_moe_cache_tensor_desc down_desc = { 0 };
-        if (down) {
-            const struct ggml_tensor * down_weight = down->src[0];
-            down_desc = (struct ggml_moe_cache_tensor_desc) {
-                down_weight->name,
-                down_weight->data,
-                down_weight->nb[2],
-                down_weight->ne[0],
-                down_weight->ne[1],
-                down_weight->ne[2],
-                (int32_t)down_weight->type,
-            };
+        if (!params->threadpool->moe_preplanned) {
+            ggml_moe_cache_prepare_fusion(&fusion, down, state);
         }
-        for (int token = 0; token < n_tokens; token++) {
-            for (int id = 0; id < n_ids; id++) {
-                const int row = token*n_ids + id;
-                state->ids[row] = *(const int32_t *)((const char *)ids->data + token*ids->nb[1] + id*ids->nb[0]);
-                state->acts[row] = (const float *)((const char *)acts->data + token*acts->nb[2] + (id % acts->ne[1])*acts->nb[1]);
-            }
-        }
-        // Planning without launching lets the workers start on the misses at once;
-        // thread 0 then dispatches while they compute.
-        state->node = ggml_moe_cache.fused_plan(
-                &up_desc, &gate_desc, down ? &down_desc : NULL,
-                (int)GGML_GLU_OP_SWIGLU,
-                fusion.up_min, fusion.up_max,
-                fusion.gate_min, fusion.gate_max,
-                state->ids, n_rows, n_tokens,
-                state->acts, &state->hit_mask);
-        if (!state->node && down) {
-            state->hit_mask = 0;
-            state->node = ggml_moe_cache.fused_plan(
-                    &up_desc, &gate_desc, NULL,
-                    (int)GGML_GLU_OP_SWIGLU,
-                    fusion.up_min, fusion.up_max,
-                    fusion.gate_min, fusion.gate_max,
-                    state->ids, n_rows, n_tokens,
-                    state->acts, &state->hit_mask);
-        } else if (state->node && down) {
-            state->full = 1;
-        }
-        // Keep this publication immutable until the outer graph barrier: collect()
-        // clears node while other workers may still be entering an all-hit fusion.
-        state->skipped = state->node ? fusion.skipped + state->full : 0;
-        if (state->node) {
-            struct ggml_tensor * output = state->full ? down : glu;
-            state->n_out = output->ne[0];
-            for (int row = 0; row < n_rows; row++) {
-                if (state->hit_mask & (UINT64_C(1) << row)) {
-                    state->rows[state->n_hits++] =
-                        (float *)((char *)output->data + row*output->nb[1]);
-                }
-            }
-        }
+        params->threadpool->moe_preplanned = false;
     }
 
     ggml_barrier(params->threadpool);
@@ -4858,6 +4911,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
         threadpool->ec               = GGML_STATUS_SUCCESS;
+        threadpool->moe_preplanned   = false;
     }
 
     // Allocate and init workers state
@@ -4941,6 +4995,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+    threadpool->moe_preplanned = false;
+    if (n_threads > 1 && ggml_moe_cache_preplan_graph(threadpool)) {
+        n_threads = 1;
+    }
+
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -4962,6 +5021,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             ggml_graph_compute_thread(&threadpool->workers[ith]);
         }
     } else {
+        // Preserve thread 0's explicit placement when replacing a team launch.
+        if (threadpool->moe_preplanned) {
+            ggml_thread_apply_priority(threadpool->prio);
+            if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
+                ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
+            }
+        }
         atomic_store_explicit(&threadpool->n_graph, 1, memory_order_relaxed);
         ggml_graph_compute_thread(&threadpool->workers[0]);
     }

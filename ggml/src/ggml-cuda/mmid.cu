@@ -1,6 +1,54 @@
 #include "common.cuh"
 #include "mmid.cuh"
 
+#if defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include <cub/cub.cuh>
+
+static __global__ void mm_ids_radix_prepare(
+        const int32_t * ids, int32_t * keys, int32_t * slots,
+        int pairs, int used, int stride, int experts) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= pairs) {
+        return;
+    }
+    const int expert = ids[(i/used)*stride + i%used];
+    keys[i] = expert >= 0 && expert < experts ? expert : experts;
+    slots[i] = i;
+}
+
+static __global__ void mm_ids_radix_finish(
+        const int32_t * keys, const int32_t * slots,
+        int32_t * src, int32_t * dst, int32_t * bounds,
+        int pairs, int experts, int used, int channels, int source_stride, bool inverse) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i <= experts) {
+        int lo = 0, hi = pairs;
+        while (lo < hi) {
+            const int mid = lo + (hi - lo)/2;
+            if (keys[mid] < i) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        bounds[i] = lo;
+    }
+    if (i < pairs) {
+        if (keys[i] < experts) {
+            const int slot = slots[i];
+            dst[i] = slot;
+            if (inverse) {
+                src[slot] = i;
+            } else {
+                src[i] = (slot/used)*source_stride + (slot%used)%channels;
+            }
+        } else if (!inverse) {
+            src[i] = 0;
+        }
+    }
+}
+#endif
+
 // To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
 struct mm_ids_helper_store {
     uint32_t data;
@@ -188,4 +236,43 @@ void ggml_cuda_launch_mm_ids_helper(
             launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
     }
+}
+
+void ggml_cuda_launch_mm_ids_helper(
+        ggml_cuda_pool & pool,
+        const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
+        int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, bool write_inverse, cudaStream_t stream) {
+#if defined(GGML_CUDA_USE_CUB) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // Long 512-expert batches otherwise scan every route once per expert.
+    // Stable radix sorting preserves token/slot order within each expert.
+    // Short batches keep the faster scan; this first admission is measured SM86.
+    if (ggml_cuda_info().devices[ggml_cuda_get_device()].cc == 860 &&
+            n_experts == 512 && n_expert_used == 10 && n_tokens >= 2048 && n_tokens <= 8192 &&
+            (nchannels_y == 1 || nchannels_y == n_expert_used)) {
+        const int pairs = n_tokens*n_expert_used;
+        ggml_cuda_pool_alloc<int32_t> keys_in(pool, pairs), keys_out(pool, pairs);
+        ggml_cuda_pool_alloc<int32_t> slots_in(pool, pairs), slots_out(pool, pairs);
+        size_t scratch_bytes = 0;
+        // Ten bits include the invalid-route sentinel 512 after valid experts.
+        CUDA_CHECK(cub::DeviceRadixSort::SortPairs(nullptr, scratch_bytes,
+                keys_in.get(), keys_out.get(), slots_in.get(), slots_out.get(), pairs, 0, 10, stream));
+        ggml_cuda_pool_alloc<char> scratch(pool, scratch_bytes);
+        mm_ids_radix_prepare<<<(pairs + 255)/256, 256, 0, stream>>>(
+                ids, keys_in.get(), slots_in.get(), pairs, n_expert_used, si1, n_experts);
+        CUDA_CHECK(cub::DeviceRadixSort::SortPairs(scratch.get(), scratch_bytes,
+                keys_in.get(), keys_out.get(), slots_in.get(), slots_out.get(), pairs, 0, 10, stream));
+        if (write_inverse) {
+            CUDA_CHECK(cudaMemsetAsync(ids_src1, 0xff, size_t(pairs)*sizeof(int32_t), stream));
+        }
+        mm_ids_radix_finish<<<(pairs + 255)/256, 256, 0, stream>>>(
+                keys_out.get(), slots_out.get(), ids_src1, ids_dst, expert_bounds,
+                pairs, n_experts, n_expert_used, nchannels_y, sis1, write_inverse);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+#else
+    GGML_UNUSED(pool);
+#endif
+    ggml_cuda_launch_mm_ids_helper(ids, ids_src1, ids_dst, expert_bounds,
+            n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
 }

@@ -68,6 +68,13 @@ when an answer transitions from prose to code. Slots adapt independently and kee
 their learned depth across requests, with recovery re-armed at each new request.
 This does not increase the configured maximum or reserve additional KV capacity.
 
+For separate-cache, single-head MTP using greedy draft proposals, a positive
+`--spec-draft-p-min` stops drafting after the first below-threshold proposal.
+That already-computed proposal is still verified by the target; the threshold
+does not permit an unverified token. Shared-cache and chained-head drafting
+keep their existing threshold behavior. With the default threshold of zero,
+this stopping rule is inactive.
+
 Greedy requests, positive draft-confidence thresholds, Mirostat/adaptive-p,
 and shared-cache or chained-head MTP retain the existing drafting path. The
 probability-aware path preserves the target sampling distribution, not the exact

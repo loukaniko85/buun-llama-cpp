@@ -280,6 +280,49 @@ __global__ void topk_moe_cuda(const float *         logits,
     }
 }
 
+// Large softmax routers must not change their reduction tree merely because
+// allocator placement makes the fusion possible. Match soft_max_f32<512,512>
+// first, then reduce selected weights in rank order like SUM_ROWS (not in
+// expert-lane order). Small/decode routers retain the existing warp path.
+static __global__ void topk_moe_softmax512_prefill(
+        const float * logits, float * weights, int32_t * ids, int used, float clamp_val) {
+    __shared__ float scratch[32];
+    __shared__ float probs[512];
+    __shared__ int order[512];
+    const int lane = threadIdx.x;
+    const int64_t row = blockIdx.x;
+    const float value = logits[row*512 + lane] + 0.0f;
+    const float maximum = block_reduce<block_reduce_method::MAX, 512>(value, scratch);
+    const float exponential = expf(value - maximum);
+    __syncthreads();
+    const float total = block_reduce<block_reduce_method::SUM, 512>(exponential, scratch);
+    probs[lane] = exponential * (1.0f / total);
+    order[lane] = lane;
+    __syncthreads();
+    // Use the ordinary bitonic network, including its equal-score ordering.
+    // Choosing the smallest expert ID on ties is NOT equivalent to argsort.
+    for (int k = 2; k <= 512; k *= 2) {
+        for (int j = k/2; j > 0; j /= 2) {
+            const int partner = lane ^ j;
+            if (partner > lane && ((lane & k) == 0 ?
+                    probs[order[lane]] < probs[order[partner]] :
+                    probs[order[lane]] > probs[order[partner]])) {
+                const int previous = order[lane];
+                order[lane] = order[partner];
+                order[partner] = previous;
+            }
+            __syncthreads();
+        }
+    }
+    if (lane >= 32) return;
+    const float selected = lane < used ? probs[order[lane]] : 0.0f;
+    const float denominator = fmaxf(warp_reduce_sum(selected), clamp_val);
+    if (lane < used) {
+        ids[row*512 + lane] = order[lane];
+        weights[row*used + lane] = selected / denominator;
+    }
+}
+
 template<bool has_bias>
 static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const float *               logits,
@@ -393,6 +436,20 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.use_sqrt_softplus = args.sqrt_softplus;
     config.with_norm         = with_norm;
     config.delayed_softmax   = args.delayed_softmax;
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // Compact routing IDs expose this fusion from 256-row prefill batches
+    // on both SM75 and SM86; preserve the unfused router's ordered arithmetic.
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if ((cc == 860 || cc == 750) && n_rows >= 256 &&
+            n_experts == 512 && n_expert_used > 0 && n_expert_used <= 32 &&
+            args.softmax && with_norm && !args.sigmoid && !args.sqrt_softplus &&
+            !args.delayed_softmax && !bias && !scale) {
+        topk_moe_softmax512_prefill<<<n_rows, 512, 0, ctx.stream()>>>(
+                logits_d, weights_d, ids_d, n_expert_used, clamp_val);
+        return;
+    }
+#endif
 
     if (bias) {
         launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,

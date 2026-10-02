@@ -2,6 +2,11 @@
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// Closed gather fusion: selected order and dense stream-K partition stay fixed.
+bool ggml_cuda_flash_attn_ext_ordered(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * keys, const ggml_tensor * values,
+        const ggml_tensor * ids, const ggml_tensor * mask_cells);
+
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst);
 
 size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * dst);

@@ -3,6 +3,39 @@
 #include "convert.cuh"
 #include "turbo-quant-cuda.cuh"
 
+// Pool four selected F16 rows without materializing the gathered F32 members.
+// Keep the graph's left-associated FP32 additions (not a parallel reduction).
+static __global__ void get_rows_mean4_f16(
+        const char * keys, const char * ids, float * dst,
+        int64_t dim, int64_t blocks, int64_t streams,
+        size_t key_row, size_t key_stream, size_t ids_stream, float bias) {
+    const int64_t block = blockIdx.x;
+    for (int64_t stream = blockIdx.y; stream < streams; stream += gridDim.y) {
+        const int32_t * rows = (const int32_t *) (ids + stream*ids_stream) + 4*block;
+        const char * base = keys + stream*key_stream;
+        for (int64_t d = threadIdx.x; d < dim; d += blockDim.x) {
+            float value = __half2float(((const half *) (base + rows[0]*key_row))[d]);
+#pragma unroll
+            for (int member = 1; member < 4; ++member) {
+                value = __fadd_rn(value, __half2float(((const half *) (base + rows[member]*key_row))[d]));
+            }
+            dst[(stream*blocks + block)*dim + d] = __fmaf_rn(value, .25f, bias);
+        }
+    }
+}
+
+void ggml_cuda_op_get_rows_mean4(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * gather, ggml_tensor * dst) {
+    const ggml_tensor * keys = gather->src[0];
+    const ggml_tensor * ids = gather->src[1];
+    const dim3 grid(dst->ne[1], MIN(dst->ne[2], UINT16_MAX));
+    const int threads = (int) MIN(GGML_PAD(dst->ne[0], 32), 256);
+    get_rows_mean4_f16<<<grid, threads, 0, ctx.stream()>>>(
+        (const char *) keys->data, (const char *) ids->data, (float *) dst->data,
+        dst->ne[0], dst->ne[1], dst->ne[2], keys->nb[1], keys->nb[2], ids->nb[1],
+        ggml_get_op_params_f32(dst, 1));
+}
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,

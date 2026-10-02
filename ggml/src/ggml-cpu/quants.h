@@ -53,7 +53,7 @@ void quantize_row_iq4_nl (const float * GGML_RESTRICT x, void * GGML_RESTRICT y,
 void quantize_row_iq4_xs (const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 
 // Dot product
-#if defined(__AVX512VBMI__) && defined(__AVX512VNNI__) && defined(__AVX512VL__)
+#if defined(__AVX2__)
 void ggml_vec_dot_q2_0_q8_0_batch(int n, float * s, const void * vx, const void * const * vy, int nr);
 void ggml_vec_dot_q2_0_q8_0_batch_rows(int n, float * const * dst, const void * vx, size_t stride,
                                     const void * const * vy, int nr, int64_t rows);
