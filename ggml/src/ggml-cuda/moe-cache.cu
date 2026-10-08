@@ -2327,18 +2327,13 @@ static void moe_cache_build_pending(
     }
 }
 
-static int moe_cache_discover_pool(
-        moe_cache_session & session, moe_cache_device & device,
-        const void * host_base, size_t tensor_size, size_t expert_size,
-        int wtype, int64_t n_expert) {
-    int pool = moe_cache_find_pool(device, expert_size, wtype);
-    if (pool >= 0 && !device.pools[pool]->covers_all_entries) {
-        return pool;
+// Adds a tensor to the device's shape census; returns false when it was already counted.
+static bool moe_cache_census_tensor(
+        moe_cache_device & device, int pool, const void * host_base, size_t tensor_size,
+        size_t expert_size, int wtype, int64_t n_expert) {
+    if (device.seen_tensors.find(host_base) != device.seen_tensors.end()) {
+        return false;
     }
-    if (pool >= 0 && device.seen_tensors.find(host_base) != device.seen_tensors.end()) {
-        return pool;
-    }
-
     moe_cache_shape * shape = nullptr;
     for (moe_cache_shape & candidate : device.shapes) {
         if (candidate.expert_size == expert_size && candidate.wtype == wtype) {
@@ -2347,32 +2342,45 @@ static int moe_cache_discover_pool(
         }
     }
     if (!shape) {
-        device.shapes.push_back({expert_size, wtype, 0, 0, -1, false});
+        device.shapes.push_back({expert_size, wtype, 0, 0, pool, false});
         shape = &device.shapes.back();
-        shape->pool = pool;
     }
-
-    const bool first_visit = device.seen_tensors.emplace(
-            host_base,
-            moe_cache_seen_tensor{tensor_size, expert_size, wtype, n_expert}).second;
-    if (first_visit) {
-        if (shape->n_tensors == 0 && shape->pool < 0) {
-            shape->finished = false;
-        }
-        const uint64_t entries = (uint64_t)n_expert;
-        shape->n_entries = entries <= UINT64_MAX - shape->n_entries
-            ? shape->n_entries + entries : UINT64_MAX;
-        shape->n_tensors++;
-        device.visits_since_new_tensor = 0;
-    } else {
-        if (device.visits_since_new_tensor < SIZE_MAX) {
-            device.visits_since_new_tensor++;
-        }
+    device.seen_tensors.emplace(
+            host_base, moe_cache_seen_tensor{tensor_size, expert_size, wtype, n_expert});
+    if (shape->n_tensors == 0 && shape->pool < 0) {
+        shape->finished = false;
     }
-
+    const uint64_t entries = (uint64_t)n_expert;
+    shape->n_entries = entries <= UINT64_MAX - shape->n_entries
+        ? shape->n_entries + entries : UINT64_MAX;
+    shape->n_tensors++;
+    device.visits_since_new_tensor = 0;
     if (pool >= 0) {
-        device.pools[pool]->covers_all_entries =
-            (uint64_t)(device.pools[pool]->n_slots - device.pools[pool]->n_stream_stage_slots) >= shape->n_entries;
+        // borrowed slots past first_shared are not permanent capacity
+        moe_cache_pool & owner = *device.pools[pool];
+        owner.covers_all_entries = (uint64_t)(std::min(owner.n_slots, owner.first_shared) -
+                owner.n_stream_stage_slots) >= shape->n_entries;
+    }
+    return true;
+}
+
+static int moe_cache_discover_pool(
+        moe_cache_session & session, moe_cache_device & device,
+        const void * host_base, size_t tensor_size, size_t expert_size,
+        int wtype, int64_t n_expert) {
+    const int pool = moe_cache_find_pool(device, expert_size, wtype);
+    if (pool >= 0 && !device.pools[pool]->covers_all_entries) {
+        return pool;
+    }
+    if (pool >= 0 && device.seen_tensors.find(host_base) != device.seen_tensors.end()) {
+        return pool;
+    }
+
+    if (!moe_cache_census_tensor(device, pool, host_base, tensor_size, expert_size, wtype, n_expert) &&
+        device.visits_since_new_tensor < SIZE_MAX) {
+        device.visits_since_new_tensor++;
+    }
+    if (pool >= 0) {
         return pool;
     }
 
@@ -4026,27 +4034,33 @@ static int moe_cache_route_supported(void * opaque, void * backend_opaque, const
         weights->nb[2] != ggml_row_size(weights->type, weights->ne[0]) * weights->ne[1] ||
         weights->nb[2] < ggml_moe_cache_effective_min_expert_bytes(weights->type,
             session->config.min_expert_explicit, session->config.min_expert_bytes) ||
-        op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
-        ids->ne[0] * ids->ne[1] > moe_cache_route_log_max) {
+        op->src[1]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
         return 0;
     }
     // Mirror ggml_cuda_mul_mat_id's selection: only MMVQ and the grouped EXL3 kernel read the
     // table. Host weights take MMVQ up to the mmid cap, past the dense MMVQ/MMQ crossover.
     const int cc = ggml_cuda_info().devices[ctx->device].cc;
     const int64_t n_tokens = op->ne[2];
-    const bool table_kernel = ggml_type_is_exl3(weights->type) ? ggml_cuda_exl3_mul_mat_id_fast(op) :
-        n_tokens <= get_mmvq_mmid_max_batch(weights->type, cc);
-    if (n_tokens > MMVQ_MAX_BATCH_SIZE || !table_kernel || !ggml_backend_supports_op(backend, op)) {
-        return 0;
-    }
+    const bool routable = ids->ne[0] * ids->ne[1] <= moe_cache_route_log_max &&
+        n_tokens <= MMVQ_MAX_BATCH_SIZE &&
+        (ggml_type_is_exl3(weights->type) ? ggml_cuda_exl3_mul_mat_id_fast(op) :
+            n_tokens <= get_mmvq_mmid_max_batch(weights->type, cc)) &&
+        ggml_backend_supports_op(backend, op);
     std::lock_guard<std::mutex> lock(session->mu);
     if (session->stopping || device.dead.load()) {
         return 0;
     }
     if (moe_cache_route_get(device, weights->data)) {
-        return 1;
+        return routable ? 1 : 0;
     }
     try {
+        // Census before the batch-shape gate: warmup and prompt graphs route only their last
+        // layer, so a census taken from routed ids alone would size the pool for one layer.
+        moe_cache_census_tensor(device, moe_cache_find_pool(device, weights->nb[2], weights->type),
+                weights->data, ggml_nbytes(weights), weights->nb[2], weights->type, weights->ne[2]);
+        if (!routable) {
+            return 0;
+        }
         return moe_cache_route_register(*session, device, ctx->stream(), op) ? 1 : 0;
     } catch (...) {
         return 0;
