@@ -1,0 +1,155 @@
+name: Sync upstream and build server image
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: Rebuild even if an image for the current upstream commit already exists
+        type: boolean
+        default: false
+  schedule:
+    # Weekly. An idle week costs ~2 minutes: the build steps are skipped unless
+    # upstream actually moved (see "Check for existing image").
+    - cron: "0 17 * * 0"
+  push:
+    branches: [master]
+
+concurrency:
+  group: sync-build
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+  actions: write
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Sync fork with upstream
+        id: sync
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/spiritbuun/buun-llama-cpp.git 2>/dev/null || true
+          git fetch upstream master --no-tags
+          git log -1 --format='upstream head: %h %s' upstream/master
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "fork already contains upstream master"
+          else
+            git merge --no-edit upstream/master
+            git push origin HEAD:master
+            echo "merged upstream master and pushed"
+          fi
+          echo "up=$(git rev-parse --short=12 upstream/master)" >> "$GITHUB_OUTPUT"
+          echo "head=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Keep only this workflow enabled
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow list --all --limit 500 --json id,path,state \
+            --jq '.[] | select(.path != ".github/workflows/sync-and-build.yml" and .path != ".github/workflows/rocm-build.yml" and .path != ".github/workflows/vulkan-build.yml") | select(.state != "disabled_manually") | .id' \
+            | xargs -r -n1 gh workflow disable || true
+          echo "still active after janitor:"
+          gh workflow list --all --limit 500 --json path,state --jq '.[] | select(.state == "active") | .path'
+
+      - name: Fix build context (.dockerignore)
+        run: |
+          if grep -qxF 'models/*' .dockerignore 2>/dev/null; then
+            grep -vxF 'models/*' .dockerignore > .dockerignore.tmp
+            mv .dockerignore.tmp .dockerignore
+            echo "removed 'models/*' exclusion - chat templates must reach the build context"
+          else
+            echo "no 'models/*' exclusion present"
+          fi
+          cat .dockerignore
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h / | tail -1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for existing image
+        id: check
+        run: |
+          # Stamp = build config (Dockerfile + this workflow) + upstream commit.
+          # A CI-only commit on the fork costs no build, while a real Dockerfile
+          # or build-arg change still rebuilds exactly once.
+          CFG=$(cat .devops/cuda.Dockerfile .github/workflows/sync-and-build.yml | sha1sum | cut -c1-8)
+          echo "cfg=$CFG" >> "$GITHUB_OUTPUT"
+          exists=false
+          if docker manifest inspect "ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:cuda-${CFG}-${{ steps.sync.outputs.up }}" >/dev/null 2>&1; then
+            exists=true
+          fi
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+          echo "stamp cuda-${CFG}-${{ steps.sync.outputs.up }} already built: $exists"
+
+      - name: Set up Docker Buildx
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push server image
+        id: build
+        if: steps.check.outputs.exists == 'false' || inputs.force_build == true
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: .devops/cuda.Dockerfile
+          target: server
+          platforms: linux/amd64
+          push: true
+          # Pinned to the two cards actually in use: 3070 (sm_86) + 5060 (sm_120a).
+          # Real SASS only, no PTX and no other architectures: ~4x shorter CUDA
+          # compile, at the cost of not running on any other NVIDIA card.
+          build-args: |
+            CUDA_VERSION=12.8.1
+            CUDA_DOCKER_ARCH=86-real;120a-real
+            IMAGE_SOURCE=https://github.com/loukaniko85/buun-llama-cpp
+            IMAGE_URL=https://github.com/loukaniko85/buun-llama-cpp
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:server-cuda
+            ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:latest
+            ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:cuda-${{ steps.check.outputs.cfg }}-${{ steps.sync.outputs.up }}
+            ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:head-${{ steps.sync.outputs.head }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        if: steps.build.outputs.digest != ''
+        run: |
+          {
+            echo "### buun-llama-cpp server image built"
+            echo ""
+            echo "- pull: \`docker pull ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:server-cuda\`"
+            echo "- upstream: \`${{ steps.sync.outputs.up }}\` / fork head: \`${{ steps.sync.outputs.head }}\`"
+            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Re-check the workflow janitor
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow list --all --limit 500 --json id,path,state \
+            --jq '.[] | select(.path != ".github/workflows/sync-and-build.yml" and .path != ".github/workflows/rocm-build.yml" and .path != ".github/workflows/vulkan-build.yml") | select(.state != "disabled_manually") | .id' \
+            | xargs -r -n1 gh workflow disable || true
+          echo "active workflows at end of job:"
+          gh workflow list --all --limit 500 --json path,state --jq '.[] | select(.state == "active") | .path'
