@@ -23,6 +23,7 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
         case LLM_ARCH_GEMMA4_DFLASH_DRAFT:
         case LLM_ARCH_PLAMO3:
         case LLM_ARCH_GEMMA3:
+        case LLM_ARCH_DORY: // physical weights and virtual cache slots use different counts
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_BITNET:
         case LLM_ARCH_T5:

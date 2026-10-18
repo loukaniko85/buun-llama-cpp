@@ -11947,6 +11947,10 @@ bool llama_kv_cache::get_can_shift() const {
     if (vbr_vmm_active()) {
         return false;
     }
+    // Dory uses physical-layer RoPE profiles and post-RoPE normalization.
+    if (model.arch == LLM_ARCH_DORY) {
+        return false;
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
