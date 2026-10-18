@@ -1,67 +1,50 @@
-name: Sync upstream and build server image
+name: Build Dory server image (fork + PR 30306)
+
+# Dory = NVIDIA Nemotron Labs Dory1.0-4B (arch "dory"), ported from
+# ggml-org/llama.cpp PR #30306 onto this fork's master.
+#
+# This branch is intentionally separate: it never merges into master and it
+# never pushes the vanilla tags. The build here only publishes dory tags, so
+# `:server-cuda` / `:latest` keep tracking vanilla upstream.
+#
+# Trigger: push to `dory`, or Actions -> this workflow -> "Run workflow" with
+# ref = dory. (workflow_dispatch requires the file to exist on the default
+# branch; the path is the same on master, so dispatch-by-ref works.)
 
 on:
   workflow_dispatch:
     inputs:
       force_build:
-        description: Rebuild even if an image for the current upstream commit already exists
+        description: Rebuild even if an image for this dory commit already exists
         type: boolean
         default: false
-  schedule:
-    # Weekly. An idle week costs ~2 minutes: the build steps are skipped unless
-    # upstream actually moved (see "Check for existing image").
-    - cron: "0 17 * * 0"
   push:
-    branches: [master]
+    branches: [dory]
 
 concurrency:
-  group: sync-build
+  group: dory-build
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
   packages: write
-  actions: write
 
 jobs:
-  sync-and-build:
+  build-dory:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Checkout fork
+      - name: Checkout fork (dory branch)
         uses: actions/checkout@v6
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           submodules: recursive
 
-      - name: Sync fork with upstream
-        id: sync
+      - name: Sanity check — Dory arch present in source
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/spiritbuun/buun-llama-cpp.git 2>/dev/null || true
-          git fetch upstream master --no-tags
-          git log -1 --format='upstream head: %h %s' upstream/master
-          if git merge-base --is-ancestor upstream/master HEAD; then
-            echo "fork already contains upstream master"
-          else
-            git merge --no-edit upstream/master
-            git push origin HEAD:master
-            echo "merged upstream master and pushed"
-          fi
-          echo "up=$(git rev-parse --short=12 upstream/master)" >> "$GITHUB_OUTPUT"
-          echo "head=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Keep only this workflow enabled
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh workflow list --all --limit 500 --json id,path,state \
-            --jq '.[] | select(.path != ".github/workflows/sync-and-build.yml" and .path != ".github/workflows/rocm-build.yml" and .path != ".github/workflows/vulkan-build.yml") | select(.state != "disabled_manually") | .id' \
-            | xargs -r -n1 gh workflow disable || true
-          echo "still active after janitor:"
-          gh workflow list --all --limit 500 --json path,state --jq '.[] | select(.state == "active") | .path'
+          grep -q '"dory"' src/llama-arch.cpp || { echo "LLM_ARCH_DORY missing"; exit 1; }
+          grep -q 'llama_model_dory' src/models/models.h || { echo "llama_model_dory missing"; exit 1; }
+          echo "dory arch wiring present"
 
       - name: Fix build context (.dockerignore)
         run: |
@@ -72,7 +55,6 @@ jobs:
           else
             echo "no 'models/*' exclusion present"
           fi
-          cat .dockerignore
 
       - name: Free disk space
         run: |
@@ -89,23 +71,20 @@ jobs:
       - name: Check for existing image
         id: check
         run: |
-          # Stamp = build config (Dockerfile + this workflow) + upstream commit.
-          # A CI-only commit on the fork costs no build, while a real Dockerfile
-          # or build-arg change still rebuilds exactly once.
-          CFG=$(cat .devops/cuda.Dockerfile .github/workflows/sync-and-build.yml | sha1sum | cut -c1-8)
-          echo "cfg=$CFG" >> "$GITHUB_OUTPUT"
+          SHA=$(git rev-parse --short=12 HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           exists=false
-          if docker manifest inspect "ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:cuda-${CFG}-${{ steps.sync.outputs.up }}" >/dev/null 2>&1; then
+          if docker manifest inspect "ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:dory-$SHA" >/dev/null 2>&1; then
             exists=true
           fi
           echo "exists=$exists" >> "$GITHUB_OUTPUT"
-          echo "stamp cuda-${CFG}-${{ steps.sync.outputs.up }} already built: $exists"
+          echo "dory image for $SHA already built: $exists"
 
       - name: Set up Docker Buildx
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
         uses: docker/setup-buildx-action@v4
 
-      - name: Build and push server image
+      - name: Build and push Dory server image
         id: build
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
         uses: docker/build-push-action@v7
@@ -115,41 +94,30 @@ jobs:
           target: server
           platforms: linux/amd64
           push: true
-          # Pinned to the two cards actually in use: 3070 (sm_86) + 5060 (sm_120a).
-          # Real SASS only, no PTX and no other architectures: ~4x shorter CUDA
-          # compile, at the cost of not running on any other NVIDIA card.
+          # Same two cards as the vanilla image: 3070 (sm_86) + 5060 Ti (sm_120a).
           build-args: |
             CUDA_VERSION=12.8.1
             CUDA_DOCKER_ARCH=86-real;120a-real
-            IMAGE_SOURCE=https://github.com/loukaniko85/buun-llama-cpp
-            IMAGE_URL=https://github.com/loukaniko85/buun-llama-cpp
+            IMAGE_SOURCE=https://github.com/loukaniko85/buun-llama-cpp/tree/dory
+            IMAGE_URL=https://github.com/loukaniko85/buun-llama-cpp/tree/dory
           tags: |
-            ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:server-cuda
-            ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:latest
-            ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:cuda-${{ steps.check.outputs.cfg }}-${{ steps.sync.outputs.up }}
-            ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:head-${{ steps.sync.outputs.head }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:dory
+            ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:server-cuda-dory
+            ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:dory-${{ steps.check.outputs.sha }}
+          # Separate cache scope so a dory build never evicts the vanilla cache.
+          cache-from: type=gha,scope=dory
+          cache-to: type=gha,mode=max,scope=dory
 
       - name: Summary
         if: steps.build.outputs.digest != ''
         run: |
           {
-            echo "### buun-llama-cpp server image built"
+            echo "### Dory server image built"
             echo ""
-            echo "- pull: \`docker pull ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:server-cuda\`"
-            echo "- upstream: \`${{ steps.sync.outputs.up }}\` / fork head: \`${{ steps.sync.outputs.head }}\`"
+            echo "- pull: \`docker pull ghcr.io/${{ github.repository_owner }}/buun-llama-cpp:dory\`"
+            echo "- commit: \`${{ steps.check.outputs.sha }}\`"
             echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo "Run: \`-m /models/<dory.gguf> --host 0.0.0.0 --port 8080 -ngl 999 -c 16384 -np 2 --jinja --flash-attn on\`"
+            echo "Optional: \`--override-kv \"dory.num_loops=int:2\"\` (default 2), \`--reasoning off\` if it over-thinks."
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Re-check the workflow janitor
-        if: always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh workflow list --all --limit 500 --json id,path,state \
-            --jq '.[] | select(.path != ".github/workflows/sync-and-build.yml" and .path != ".github/workflows/rocm-build.yml" and .path != ".github/workflows/vulkan-build.yml") | select(.state != "disabled_manually") | .id' \
-            | xargs -r -n1 gh workflow disable || true
-          echo "active workflows at end of job:"
-          gh workflow list --all --limit 500 --json path,state --jq '.[] | select(.state == "active") | .path'
