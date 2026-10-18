@@ -66,6 +66,13 @@ GGML_API bool ggml_gallocr_reserve_n(
     struct ggml_cgraph * graph,
     const int * node_buffer_ids,
     const int * leaf_buffer_ids);
+// like ggml_gallocr_reserve_n, but never (re)allocates a buffer: returns false when one would have to
+// grow, and then ggml_gallocr_reserve_n has to follow
+GGML_API bool ggml_gallocr_reserve_n_in_place(
+    ggml_gallocr_t galloc,
+    struct ggml_cgraph * graph,
+    const int * node_buffer_ids,
+    const int * leaf_buffer_ids);
 
 // automatic reallocation if the topology changes when using a single buffer
 // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)

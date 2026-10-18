@@ -1850,6 +1850,20 @@ void ggml_cuda_fattn_scratch_free(ggml_backend_cuda_context & ctx) {
     }
 }
 
+void ggml_cuda_fattn_scratch_reserve(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph) {
+    size_t q_size = 0;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_is_turbo_kv_type(node->src[1]->type) &&
+                node->src[0]->ne[0] % 128 == 0) {
+            q_size = std::max(q_size, ggml_nelements(node->src[0]) * sizeof(float));
+        }
+    }
+    if (q_size > 0) {
+        q_rot_buf_ensure(ctx, q_size);
+    }
+}
+
 enum best_fattn_kernel {
     BEST_FATTN_KERNEL_NONE      =   0,
     BEST_FATTN_KERNEL_VEC       = 100,

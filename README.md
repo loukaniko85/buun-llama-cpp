@@ -217,8 +217,9 @@ Leave the other resource knobs unset for the first run. The defaults now:
 - persist a bounded per-model expert heatmap in the normal llama.cpp cache directory for later
   prewarming.
 
-`--moe-cache auto` is the conservative, repack-preserving default and can use one or more eligible
-devices. `--moe-cache on` forces canonical CPU expert weights immediately. `soft` remains available
+`--moe-cache auto` is the default and can use one or more eligible devices; it stays off when less
+than 1 GiB of VRAM is spare. Add `--no-repack` to keep canonical CPU expert weights when you place
+experts yourself with `-ot`; `--moe-cache on` is a deprecated spelling of that. `soft` remains available
 when partial expert eviction is specifically desired: it first tries spare VRAM with stock placement,
 then evicts the minimum expert footprint needed to form cache pools.
 
@@ -272,7 +273,7 @@ speed. Static `-ctk t8 -ctv t8` and `-ctk t4 -ctv t4` remain useful for fixed-ti
 ```sh
 ./build/bin/llama-server \
   -m DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
-  -ngl auto -sm layer -fa on -c 8192 -np 1 -ub 4096 \
+  -ngl auto -sm layer -fa on -c 8192 -np 1 \
   --vbr-entry t8 \
   --fit on --moe-cache auto \
   --moe-cache-expert-parallel auto \
@@ -292,7 +293,7 @@ unchanged.
 ./build/bin/llama-server \
   -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
   -md MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
-  -ngl auto -sm layer -fa on -c 8192 -np 1 -ub 512 \
+  -ngl auto -sm layer -fa on -c 8192 -np 1 \
   --vbr-entry t8 \
   --fit on --moe-cache auto \
   --spec-type draft-mtp \
@@ -310,7 +311,7 @@ substantially slower in testing.
 ./build/bin/llama-server \
   -m DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
   -md dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf \
-  -ngl auto -sm layer -fa on -c 8192 -np 1 -ub 4096 \
+  -ngl auto -sm layer -fa on -c 8192 -np 1 \
   --vbr-entry t8 \
   --fit on --moe-cache auto \
   --moe-cache-expert-parallel auto \
@@ -351,7 +352,7 @@ use `--spec-draft-device none` to keep the entire drafter on CPU.
 ./build/bin/llama-server \
   -m DeepSeek-V4-Flash-0731-UD-IQ2_M-00001-of-00003.gguf \
   -md dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf \
-  -ngl auto -sm layer -fa on -c 8192 -np 1 -ub 4096 \
+  -ngl auto -sm layer -fa on -c 8192 -np 1 \
   --vbr-entry t8 \
   --fit on --moe-cache auto \
   --spec-type draft-dspark -ngld 0 -otd 'exps=CPU' \
@@ -380,9 +381,10 @@ workspaces and transient allocations still need headroom.
 
 ### Tuning on another host
 
-First run the adaptive recipe without `-t`, `-tb`, a reserve environment variable, or a fixed cache
-budget. Let the persistent heatmap learn during normal use; it is keyed by model semantics rather
-than the model's pathname. Pass `-lv 4` once to confirm the resolved thread count, mmap policy,
+First run the adaptive recipe without `-t`, `-tb`, `-ub`, a reserve environment variable, or a fixed
+cache budget. The ubatch size is chosen automatically from the expert placement and the free VRAM.
+Let the persistent heatmap learn during normal use; it is keyed by model semantics rather than the
+model's pathname. Pass `-lv 4` once to confirm the resolved thread count, mmap policy,
 per-device reserve and pools, nonzero hits, and zero fill/dispatch/collect failures.
 
 Only tune manually when a repeatable gap remains. Change one group at a time and restart the server
@@ -405,8 +407,9 @@ temperature-0 numerical trajectory or luckier speculative acceptance is not a re
 6. Recheck the winner in reverse order against the adaptive configuration to catch temperature,
    power, host-load, cache-warmth, and output-trajectory drift.
 
-The reported PP figures used `-ub 4096`, five distinct 2,048-token prompts per server, no reusable
-prefix, and one discarded cold prompt. Two server loads were run in reverse single/dual order; the
+The reported PP figures were measured with an explicit `-ub 4096` (before the automatic ubatch
+choice existed), five distinct 2,048-token prompts per server, no reusable prefix, and one
+discarded cold prompt. Two server loads were run in reverse single/dual order; the
 eight warmed measurements averaged 332.8 pp/s on one 3090 and 326.3 pp/s on two. Layer splitting
 helps decode but adds device handoffs during the already-efficient large-batch prefill path, so a
 second 3090 did not improve PP in this configuration.

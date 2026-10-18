@@ -31,11 +31,16 @@ extern "C" {
         GGML_NUMA_STRATEGY_ISOLATE    = 2,
         GGML_NUMA_STRATEGY_NUMACTL    = 3,
         GGML_NUMA_STRATEGY_MIRROR     = 4,
+        GGML_NUMA_STRATEGY_EXPERTS    = 5, // home row part k of every mapped MoE expert on node k
         GGML_NUMA_STRATEGY_COUNT
     };
 
     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
+    // GGML_NUMA_STRATEGY_EXPERTS: re-read the n_expert contiguous experts of n_rows rows of row_size bytes
+    // at offset of file fd into the page cache, row part k of each from threads pinned to node k.
+    // Returns false if not applied.
+    GGML_BACKEND_API bool    ggml_numa_place_experts(int fd, size_t offset, size_t row_size, int64_t n_rows, int64_t n_expert);
 
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);

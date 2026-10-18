@@ -402,6 +402,8 @@ extern "C" {
         uint32_t n_ubatch;              // physical maximum batch size
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        int32_t  layer_begin;           // run only layers [layer_begin, layer_end) of the trunk, 0/0 = all [EXPERIMENTAL]
+        int32_t  layer_end;             //   the halves exchange the residual stream through a model-owned buffer
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation

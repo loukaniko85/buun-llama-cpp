@@ -2220,6 +2220,27 @@ llama_kv_cache::vbr_shared_scratch_registration llama_kv_cache::vbr_shared_scrat
     return vbr_shared_scratch_registration(registry, id);
 }
 
+// Widen k_row/v_row to one layer's f16 dequant-scratch rows. A layer without a V tensor (MLA
+// latent) attends V as a view of K, which flash-attention materializes with K's type into the
+// V-side scratch — K's row bounds that view.
+static void vbr_scratch_rows_widen(const ggml_tensor * tk, ggml_type type_k,
+                                   const ggml_tensor * tv, ggml_type type_v,
+                                   size_t & k_row, size_t & v_row) {
+    if (tv == nullptr && tk != nullptr) {
+        tv     = tk;
+        type_v = type_k;
+    }
+    bool need_k = false;
+    bool need_v = false;
+    ggml_vbr_kv_dequant_sides(tk ? type_k : GGML_TYPE_F16, tv ? type_v : GGML_TYPE_F16, &need_k, &need_v);
+    if (need_k) {
+        k_row = std::max(k_row, ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
+    }
+    if (need_v) {
+        v_row = std::max(v_row, ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
+    }
+}
+
 void llama_kv_cache::vbr_shared_scratch_visit(
         const std::vector<ggml_type> & terminal_types,
         const vbr_device_watermarks & terminal_watermarks,
@@ -2281,15 +2302,7 @@ void llama_kv_cache::vbr_shared_scratch_visit(
             if (slots.v != vbr_shared_scratch_registry::no_slot) {
                 std::tie(tv, type_v) = tensor_and_type(slots.v);
             }
-            bool need_k = false;
-            bool need_v = false;
-            ggml_vbr_kv_dequant_sides(type_k, type_v, &need_k, &need_v);
-            if (need_k && tk != nullptr) {
-                k_row = std::max(k_row, ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
-            }
-            if (need_v && tv != nullptr) {
-                v_row = std::max(v_row, ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
-            }
+            vbr_scratch_rows_widen(tk, type_k, tv, type_v, k_row, v_row);
         }
         const auto scale_row = [&](size_t row) {
             if (wm->second != 0 && row > SIZE_MAX/(size_t) wm->second) {
@@ -3378,6 +3391,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                 used_max_p1[s] = v_cells[s].used_max_p1();
             }
             scratch_cells = 0;
+            uint32_t n_kv_max        = 0;
+            size_t   stream_span_max = 0;
             const uint32_t n_pad_cur = std::max(n_pad, get_pad_floor());
             for (const auto & sinfo : sinfos) {
                 uint32_t n_kv = 0;
@@ -3391,6 +3406,12 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare_with_slots(
                 }
                 const size_t stream_span = (size_t) sinfo.s1 - sinfo.s0 + 1;
                 scratch_cells = std::max(scratch_cells, (size_t) n_kv * stream_span);
+                n_kv_max        = std::max(n_kv_max, n_kv);
+                stream_span_max = std::max(stream_span_max, stream_span);
+            }
+            if (spans_devices()) {
+                // batch-stable ubatches all read up to the batch's last cell (see llama_kv_cache_context)
+                scratch_cells = std::max(scratch_cells, (size_t) n_kv_max * stream_span_max);
             }
         }
         if (!vbr_scratch_reserve(scratch_cells)) {
@@ -4546,16 +4567,8 @@ bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
             for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
                 const ggml_tensor * tk = p.k[ikv].t;
                 const ggml_tensor * tv = p.v[ikv].t;
-                bool need_k = false;
-                bool need_v = false;
-                ggml_vbr_kv_dequant_sides(tk ? tk->type : GGML_TYPE_F16,
-                                          tv ? tv->type : GGML_TYPE_F16, &need_k, &need_v);
-                if (need_k && tk) {
-                    p.scratch_k_row = std::max(p.scratch_k_row, ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
-                }
-                if (need_v && tv) {
-                    p.scratch_v_row = std::max(p.scratch_v_row, ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
-                }
+                vbr_scratch_rows_widen(tk, tk ? tk->type : GGML_TYPE_F16, tv, tv ? tv->type : GGML_TYPE_F16,
+                                       p.scratch_k_row, p.scratch_v_row);
             }
             p.scratch_rows_epoch = vbr_tier_epoch_;
         }
@@ -4593,16 +4606,8 @@ bool llama_kv_cache::vbr_scratch_reserve(size_t flat_cells) {
             for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
                 const ggml_tensor * tk = b.k[ikv];
                 const ggml_tensor * tv = b.v[ikv];
-                bool need_k = false;
-                bool need_v = false;
-                ggml_vbr_kv_dequant_sides(tk ? tk->type : GGML_TYPE_F16,
-                                          tv ? tv->type : GGML_TYPE_F16, &need_k, &need_v);
-                if (need_k && tk) {
-                    b.k_row = std::max(b.k_row, ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
-                }
-                if (need_v && tv) {
-                    b.v_row = std::max(b.v_row, ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
-                }
+                vbr_scratch_rows_widen(tk, tk ? tk->type : GGML_TYPE_F16, tv, tv ? tv->type : GGML_TYPE_F16,
+                                       b.k_row, b.v_row);
             }
             b.rows_epoch = owner_epoch;
         }
@@ -5400,28 +5405,18 @@ double llama_kv_cache::memory_vbr_scratch_bytes_per_token(ggml_type entry_k, ggm
                        : (layers[0].k ? layers[0].k->type : GGML_TYPE_F16);
     const ggml_type ev = entry_v != GGML_TYPE_COUNT ? entry_v
                        : (layers[0].v ? layers[0].v->type : GGML_TYPE_F16);
-    bool ak = false;
-    bool av = false;
-    ggml_vbr_kv_dequant_sides(settled_type(ek, vbr_params_.pin_k),
-                              settled_type(ev, vbr_params_.pin_v), &ak, &av);
-    if (!ak && !av) {
-        return 0.0;
-    }
     // Widest f16 row per active side over the canonical layer tensors — a SINGLE-DEVICE basis:
     // the only caller is the fit's no_alloc dry-load context, where pools are never built and
     // the dry load is single-device. (A live multi-device caller would need per-pool scratch
     // sums; deliberately not built for a dead path.)
+    const ggml_type sk = settled_type(ek, vbr_params_.pin_k);
+    const ggml_type sv = settled_type(ev, vbr_params_.pin_v);
     size_t k_row = 0;
     size_t v_row = 0;
     for (const auto & L : layers) {
-        if (L.k != nullptr) {
-            k_row = std::max(k_row, ggml_row_size(GGML_TYPE_F16, L.k->ne[0]));
-        }
-        if (L.v != nullptr) {
-            v_row = std::max(v_row, ggml_row_size(GGML_TYPE_F16, L.v->ne[0]));
-        }
+        vbr_scratch_rows_widen(L.k, sk, L.v, sv, k_row, v_row);
     }
-    return (ak ? (double) k_row : 0.0) + (av ? (double) v_row : 0.0);
+    return (double) k_row + (double) v_row;
 }
 
 // --vbr-floor (cparams min_bits; env VBR_MIN_BITS override, decimal bits/value): a LITERAL
@@ -9943,28 +9938,13 @@ bool llama_kv_cache::vbr_import_destination_pricing_begin(
                 device->scratch_k_current, p.scratch_k_reserved);
             device->scratch_v_current = std::max<uint64_t>(
                 device->scratch_v_current, p.scratch_v_reserved);
+            size_t k_row = 0;
+            size_t v_row = 0;
             for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
-                const auto * tk = p.k[ikv].t;
-                const auto * tv = p.v[ikv].t;
-                bool need_k = false;
-                bool need_v = false;
-                ggml_vbr_kv_dequant_sides(
-                    tk ? types[ikv*2] : GGML_TYPE_F16,
-                    tv ? types[ikv*2 + 1] : GGML_TYPE_F16,
-                    &need_k, &need_v);
-                if (need_k && tk) {
-                    device->scratch_k_needed = std::max(
-                        device->scratch_k_needed, multiply(
-                            ggml_row_size(GGML_TYPE_F16, tk->ne[0]),
-                            projected_wm_cells));
-                }
-                if (need_v && tv) {
-                    device->scratch_v_needed = std::max(
-                        device->scratch_v_needed, multiply(
-                            ggml_row_size(GGML_TYPE_F16, tv->ne[0]),
-                            projected_wm_cells));
-                }
+                vbr_scratch_rows_widen(p.k[ikv].t, types[ikv*2], p.v[ikv].t, types[ikv*2 + 1], k_row, v_row);
             }
+            device->scratch_k_needed = std::max(device->scratch_k_needed, multiply(k_row, projected_wm_cells));
+            device->scratch_v_needed = std::max(device->scratch_v_needed, multiply(v_row, projected_wm_cells));
         }
         std::sort(
             output.devices.begin(), output.devices.end(),
@@ -10033,22 +10013,8 @@ bool llama_kv_cache::vbr_import_destination_pricing_apply(
                 if (!p.vmm || p.be != device.be || p.device != device.device) {
                     continue;
                 }
-                const auto * tk = p.k[ikv].t;
-                const auto * tv = p.v[ikv].t;
-                bool need_k = false;
-                bool need_v = false;
-                ggml_vbr_kv_dequant_sides(
-                    tk ? pricing.types[ikv*2] : GGML_TYPE_F16,
-                    tv ? pricing.types[ikv*2 + 1] : GGML_TYPE_F16,
-                    &need_k, &need_v);
-                if (need_k && tk) {
-                    k_row = std::max(
-                        k_row, ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
-                }
-                if (need_v && tv) {
-                    v_row = std::max(
-                        v_row, ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
-                }
+                vbr_scratch_rows_widen(p.k[ikv].t, pricing.types[ikv*2], p.v[ikv].t, pricing.types[ikv*2 + 1],
+                                       k_row, v_row);
             }
             if (k_row != 0) {
                 if (k_row > UINT64_MAX/pricing.watermark_cells) {
@@ -10949,15 +10915,7 @@ bool llama_kv_cache::vbr_tx_reprice(vbr_shed_tx & tx, bool actual) const {
                         ? state.types_after[ikv*2] : (tk ? tk->type : GGML_TYPE_F16);
                 const ggml_type type_v = state.types_after[ikv*2 + 1] != GGML_TYPE_COUNT
                         ? state.types_after[ikv*2 + 1] : (tv ? tv->type : GGML_TYPE_F16);
-                bool need_k = false;
-                bool need_v = false;
-                ggml_vbr_kv_dequant_sides(type_k, type_v, &need_k, &need_v);
-                if (need_k && tk != nullptr) {
-                    k_row = std::max(k_row, ggml_row_size(GGML_TYPE_F16, tk->ne[0]));
-                }
-                if (need_v && tv != nullptr) {
-                    v_row = std::max(v_row, ggml_row_size(GGML_TYPE_F16, tv->ne[0]));
-                }
+                vbr_scratch_rows_widen(tk, type_k, tv, type_v, k_row, v_row);
             }
             const uint32_t terminal_wm = std::max(p.wm_cells, state.incoming_wm);
             if ((terminal_wm != 0 && k_row > SIZE_MAX/(size_t) terminal_wm) ||
@@ -12134,7 +12092,7 @@ uint32_t llama_kv_cache::get_stream(llama_seq_id seq_id) const {
     return seq_to_stream[seq_id];
 }
 
-uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, uint32_t n_used_min) const {
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
@@ -12143,8 +12101,9 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
+        const uint32_t n_used = std::max(cells.used_max_p1(), n_used_min);
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(n_used, n_pad_cur))), result);
     }
 
     return result;
@@ -13860,7 +13819,31 @@ llama_kv_cache_context::llama_kv_cache_context(
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_kv_cache::slot_info_vec_t sinfos,
-        std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+        std::vector<llama_ubatch> ubatches,
+        bool batch_stable) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+    // every ubatch of a multi-ubatch batch reads up to the batch's last cell, so their graphs keep one shape
+    // and are reused, which pipeline parallelism needs to overlap them
+    if (batch_stable && kv->spans_devices() && this->sinfos.size() > 1) {
+        for (const auto & sinfo : this->sinfos) {
+            for (const auto & idxs : sinfo.idxs) {
+                for (const uint32_t idx : idxs) {
+                    n_used_batch = std::max(n_used_batch, idx + 1);
+                }
+            }
+        }
+        uint32_t n_kv_batch = 0;
+        for (const auto & sinfo : this->sinfos) {
+            n_kv_batch = std::max(n_kv_batch, kv->get_n_kv(sinfo, n_used_batch));
+        }
+        // out of VBR memory: the ubatches grow their reads as they go, at the cost of a graph per ubatch
+        if (!kv->vbr_map_reads(n_kv_batch)) {
+            n_used_batch = 0;
+        }
+    }
+}
+
+bool llama_kv_cache::vbr_map_reads(uint32_t n_kv) {
+    return !vbr_vmm_active() || vbr_vmm_try_map(n_kv);
 }
 
 llama_kv_cache_context::~llama_kv_cache_context() = default;
@@ -13886,7 +13869,7 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    n_kv = kv->get_n_kv(sinfos[i_cur], n_used_batch);
 
     return true;
 }

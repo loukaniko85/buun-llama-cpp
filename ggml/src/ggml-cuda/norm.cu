@@ -5,10 +5,11 @@
 
 // Decode-only, one complete normalization row per block. Load both inputs
 // before the reduction barrier so an exactly in-place F32 output is safe.
+// The gate goes through SiLU, or through a sigmoid with sigmoid_gate.
 template <int block_size, typename dst_t>
 static __global__ void rms_norm_silu_f32(
         const float * x, const float * gamma, const float * gate, dst_t * dst,
-        int ncols, int64_t gate_stride, int64_t gate_channel, int64_t gate_sample, float eps) {
+        int ncols, int64_t gate_stride, int64_t gate_channel, int64_t gate_sample, float eps, bool sigmoid_gate) {
     const int col = threadIdx.x;
     const int row = (blockIdx.z*gridDim.y + blockIdx.y)*gridDim.x + blockIdx.x;
     x += row*ncols;
@@ -21,51 +22,53 @@ static __global__ void rms_norm_silu_f32(
     sum = block_reduce<block_reduce_method::SUM, block_size>(sum, shared);
     const float scale = rsqrtf(sum/ncols + eps);
     const float normalized = __fmul_rn(__fmul_rn(scale, value), gamma[col]);
-    dst[row*ncols + col] = dst_t(__fmul_rn(ggml_cuda_op_silu_single(z), normalized));
+    const float g = sigmoid_gate ? ggml_cuda_op_sigmoid_single(z) : ggml_cuda_op_silu_single(z);
+    dst[row*ncols + col] = dst_t(__fmul_rn(g, normalized));
 }
 
 template <typename dst_t>
 static void rms_norm_silu_cuda(ggml_backend_cuda_context & ctx, const ggml_tensor * x,
-        const ggml_tensor * gamma, const ggml_tensor * gate, ggml_tensor * dst, float eps) {
+        const ggml_tensor * gamma, const ggml_tensor * gate, ggml_tensor * dst, float eps, bool sigmoid_gate) {
     if (x->ne[0] == 128) {
         rms_norm_silu_f32<128, dst_t><<<dim3(x->ne[1], x->ne[2], x->ne[3]), 128, 0, ctx.stream()>>>(
             static_cast<const float *>(x->data), static_cast<const float *>(gamma->data),
             static_cast<const float *>(gate->data), static_cast<dst_t *>(dst->data),
-            x->ne[0], gate->nb[1]/sizeof(float), gate->nb[2]/sizeof(float), gate->nb[3]/sizeof(float), eps);
+            x->ne[0], gate->nb[1]/sizeof(float), gate->nb[2]/sizeof(float), gate->nb[3]/sizeof(float), eps, sigmoid_gate);
     } else {
         rms_norm_silu_f32<256, dst_t><<<dim3(x->ne[1], x->ne[2], x->ne[3]), 256, 0, ctx.stream()>>>(
             static_cast<const float *>(x->data), static_cast<const float *>(gamma->data),
             static_cast<const float *>(gate->data), static_cast<dst_t *>(dst->data),
-            x->ne[0], gate->nb[1]/sizeof(float), gate->nb[2]/sizeof(float), gate->nb[3]/sizeof(float), eps);
+            x->ne[0], gate->nb[1]/sizeof(float), gate->nb[2]/sizeof(float), gate->nb[3]/sizeof(float), eps, sigmoid_gate);
     }
 }
 
 void ggml_cuda_op_rms_norm_silu(
         ggml_backend_cuda_context & ctx, const ggml_tensor * rms,
         const ggml_tensor * gamma, const ggml_tensor * gate, ggml_tensor * dst,
-        const ggml_tensor * bf16_activation) {
+        const ggml_tensor * bf16_activation, bool sigmoid_gate) {
     const ggml_tensor * x = rms->src[0];
     float eps;
     memcpy(&eps, rms->op_params, sizeof(eps));
     GGML_ASSERT((x->ne[0] == 128 || x->ne[0] == 256) && ggml_is_contiguous(x));
 #if !defined(GGML_USE_HIP)
     if (bf16_activation != nullptr) {
-        rms_norm_silu_cuda<nv_bfloat16>(ctx, x, gamma, gate, dst, eps);
+        rms_norm_silu_cuda<nv_bfloat16>(ctx, x, gamma, gate, dst, eps, sigmoid_gate);
         ctx.humming_bf16_activations.insert(bf16_activation);
     } else
 #else
     GGML_UNUSED(bf16_activation);
 #endif
     {
-        rms_norm_silu_cuda<float>(ctx, x, gamma, gate, dst, eps);
+        rms_norm_silu_cuda<float>(ctx, x, gamma, gate, dst, eps, sigmoid_gate);
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
+// gamma/beta, when set, fold a following per-column MUL/ADD with the unfused roundings.
 template <int block_size>
 static __global__ void norm_f32(
         const float * x, float * dst, const int ncols, const int64_t stride_row, const int64_t stride_channel,
-        const int64_t stride_sample, const float eps) {
+        const int64_t stride_sample, const float eps, const float * gamma, const float * beta) {
     const int nrows     = gridDim.x;
     const int nchannels = gridDim.y;
 
@@ -95,7 +98,14 @@ static __global__ void norm_f32(
     const float inv_std = rsqrtf(var + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
-        dst[col] = (x[col] - mean) * inv_std;
+        float v = (x[col] - mean) * inv_std;
+        if (gamma != nullptr) {
+            v = __fmul_rn(v, gamma[col]);
+        }
+        if (beta != nullptr) {
+            v = __fadd_rn(v, beta[col]);
+        }
+        dst[col] = v;
     }
 }
 
@@ -536,14 +546,17 @@ static __global__ void l2_norm_pair_f32(
 
 static void norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
-        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
+        const float * gamma, const float * beta, cudaStream_t stream) {
     const dim3 blocks_num(nrows, nchannels, nsamples);
     if (ncols < 1024) {
         const dim3 block_dims(WARP_SIZE, 1, 1);
-        norm_f32<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+        norm_f32<WARP_SIZE><<<blocks_num, block_dims, 0, stream>>>(
+            x, dst, ncols, stride_row, stride_channel, stride_sample, eps, gamma, beta);
     } else {
         const dim3 block_dims(1024, 1, 1);
-        norm_f32<1024><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps);
+        norm_f32<1024><<<blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float2): 0, stream>>>(
+            x, dst, ncols, stride_row, stride_channel, stride_sample, eps, gamma, beta);
     }
 }
 
@@ -750,10 +763,11 @@ static void l2_norm_f32_cuda(
     }
 }
 
-void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+        const ggml_tensor * gamma, const ggml_tensor * beta, ggml_tensor * out) {
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *) src0->data;
-    float * dst_d = (float *) dst->data;
+    float * dst_d = (float *) (out ? out : dst)->data;
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
@@ -771,7 +785,8 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t s02 = nb02 / ts0;
     const int64_t s03 = nb03 / ts0;
 
-    norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
+    norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps,
+        gamma ? (const float *) gamma->data : nullptr, beta ? (const float *) beta->data : nullptr, stream);
 }
 
 void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

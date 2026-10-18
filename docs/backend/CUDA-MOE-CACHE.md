@@ -61,9 +61,11 @@ With default settings, a node must satisfy all of these conditions:
 
 Each physical device budget is coordinated across every target, draft, MTP, and server scheduler in the process. It is claimed once, at first eligible use. Shape inventory counts the exact number of experts in every observed tensor; mixed expert counts do not reserve nonexistent slots. Device reservations are tracked per participating session, so releasing a high-reserve target immediately restores the correct capacity for the remaining sessions.
 
-The automatic reserve is hardware-derived. By default it is 6% of physical
-VRAM rounded down to 128 MiB, clamped to 1024--3072 MiB and at most one quarter
-of the device. This resolves to 1408 MiB on a 24 GiB RTX 3090. An explicit
+The automatic reserve is hardware-derived. By default it is 3% of physical
+VRAM rounded down to 128 MiB, clamped to 512--3072 MiB and at most one quarter
+of the device. This resolves to 640 MiB on a 24 GiB RTX 3090. When an
+allocation still fails, the cache gives up idle 64 MiB chunks before the
+allocator retries. An explicit
 `GGML_CUDA_MOE_CACHE_RESERVE_MB` remains authoritative. The automatic budget is:
 
 ```
@@ -148,7 +150,7 @@ Measure this model with three separate `llama-bench` arms and otherwise identica
 
 1. `--moe-cache off --repack on`: optimized CPU-expert baseline.
 2. `--moe-cache off --repack off`: canonical CPU-expert baseline.
-3. `--moe-cache on --repack off`, or a fixed cache budget with `--repack off`: cache arm.
+3. `--moe-cache auto --repack off`, or a fixed cache budget: cache arm.
 
 Other programs that use the common argument parser spell the repacking switches as `--repack` and `--no-repack` rather than `--repack on` and `--repack off`.
 
@@ -249,7 +251,7 @@ The following environment variables are implementation controls, not a stable co
 | `GGML_CUDA_MOE_CACHE_QUEUE` | `128` | Maximum queued jobs per device |
 | `GGML_CUDA_MOE_CACHE_QUEUE_MB` | `512` | Maximum queued source bytes per device |
 | `GGML_CUDA_MOE_CACHE_STATS` | `0` | Collection-call interval for periodic statistics, or `0` for teardown only |
-| `GGML_CUDA_MOE_CACHE_NDEV` | all | Maximum selected CUDA devices used by a session |
+| `GGML_CUDA_MOE_CACHE_NDEV` | all | Maximum CUDA devices used by a session; beyond it, those with the most free memory are kept |
 | `GGML_CUDA_MOE_CACHE_SERIAL_FILL` | hardware dependent | Serialize fills across devices; defaults to `0` with at least two compute capability 8.0 or newer devices and `1` otherwise |
 | `GGML_CUDA_MOE_CACHE_DEDICATED_MMV` | `0` | Force the cache-specific activation-map matvec; compatible routing uses the existing modulo-index MMV path by default |
 | `GGML_CUDA_MOE_CACHE_DOWN_DEDICATED_MMV` | `0` | Use the cache-specific MMV for a full-fusion down projection; the generic modulo-index MMV remains the default |

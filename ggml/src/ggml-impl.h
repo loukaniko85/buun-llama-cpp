@@ -374,6 +374,9 @@ struct ggml_cgraph {
     // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
     // a value of 0 means it is not set and should be ignored
     uint64_t uid;
+
+    // set by the scheduler on a split that pipelines with the other backends' splits
+    bool pipelined;
 };
 
 // returns a slice of cgraph with nodes [i0, i1)

@@ -857,6 +857,9 @@ struct llama_model {
     ggml_backend_dev_t dev_layer(int il) const;
     ggml_backend_dev_t dev_output() const;
 
+    // shared buffer that layer-split contexts exchange the residual stream through at layer il
+    ggml_tensor * get_layer_hop(int il, int64_t n_rows) const;
+
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
@@ -870,6 +873,9 @@ struct llama_model {
 
     bool supports_classic_vbr() const;
     bool supports_turbo_vbr() const;
+
+    // the MTP graph reads and writes the greedy draft chain stages
+    bool supports_mtp_draft_chain() const;
 
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 

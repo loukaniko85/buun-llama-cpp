@@ -48,6 +48,7 @@
 #if !defined(GGML_USE_HIP)
 bool ggml_cuda_humming_fp8_is_repacked(const ggml_tensor * tensor);
 #endif
+bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer);
 
 #if defined(GGML_USE_HIP)
 #include "vendors/hip.h"
@@ -157,6 +158,34 @@ static __device__ __forceinline__ void ggml_cuda_pdl_lc() {
 #if defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
     cudaTriggerProgrammaticLaunchCompletion();
 #endif // defined(GGML_CUDA_USE_PDL) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+}
+
+// Grid-strided L2 prefetch (evict_last) of n_bytes at p for a later kernel; a no-op before Ampere and on HIP/MUSA.
+static __device__ __forceinline__ void ggml_cuda_prefetch_l2(const char * p, const int64_t n_bytes) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    const int64_t stride = 128*(int64_t) gridDim.x*blockDim.x;
+    for (int64_t o = 128*((int64_t) blockIdx.x*blockDim.x + threadIdx.x); o < n_bytes; o += stride) {
+        asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(p + o));
+    }
+#else
+    GGML_UNUSED(p);
+    GGML_UNUSED(n_bytes);
+#endif
+}
+
+// Completion order of this block within the grid, after its global writes are visible device-wide:
+// the block that gets gridDim.x - 1 is the last one and may read every other block's results with __ldcg.
+// Every thread of the block must call it. atomicInc wraps the counter to 0 on the last block,
+// leaving it ready for the next launch.
+static __device__ __forceinline__ unsigned int ggml_cuda_block_ticket(unsigned int * counter) {
+    __shared__ unsigned int ticket;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
+        ticket = atomicInc(counter, gridDim.x - 1);
+    }
+    __syncthreads();
+    return ticket;
 }
 
 #ifdef __CUDA_ARCH_LIST__
@@ -402,6 +431,12 @@ static bool ggml_cuda_is_aligned(const ggml_tensor * tensor, const size_t alignm
            tensor->nb[1] % alignment == 0 &&
            tensor->nb[2] % alignment == 0 &&
            tensor->nb[3] % alignment == 0;
+}
+
+// t is s, or a contiguous view of all of s at offset 0 (a reshape)
+static bool ggml_cuda_is_whole_reshape(const ggml_tensor * t, const ggml_tensor * s) {
+    return t == s || (t->view_src == s && t->view_offs == 0 && ggml_is_contiguous(t) &&
+        ggml_nelements(t) == ggml_nelements(s));
 }
 
 static constexpr __device__ int ggml_cuda_get_physical_warp_size() {
@@ -1261,7 +1296,8 @@ struct ggml_cuda_device_info {
         int     nsm;                            // number of streaming multiprocessors
         size_t  smpb;                           // max. shared memory per block
         size_t  smpbo;                          // max. shared memory per block (with opt-in)
-        bool    integrated;                     // Device is integrated as opposed to discrete
+        size_t  l2_size;                        // L2 cache size in bytes (of the physical GPU)
+        bool    integrated;                    // Device is integrated as opposed to discrete
         bool    vmm;                            // virtual memory support
         size_t  vmm_granularity;                // granularity of virtual memory
         size_t  total_vram;
@@ -1862,7 +1898,22 @@ struct ggml_backend_cuda_context {
 
     // EXL3 reductions can overlap across backend contexts and streams.
     int * exl3_int8_counter_storage[GGML_CUDA_MAX_STREAMS] = {};
+
+    // ggml_cuda_block_ticket counters, one per ggml_cuda_ticket_slot, so that launches on other
+    // contexts and streams of the same device cannot take each other's tickets.
+    unsigned int * ticket_counter_storage[GGML_CUDA_MAX_STREAMS] = {};
 };
+
+enum ggml_cuda_ticket_slot {
+    GGML_CUDA_TICKET_ROUTER_TOPK_MOE,
+    GGML_CUDA_TICKET_DSV4_HC_PRE,
+    GGML_CUDA_TICKET_DSV4_HC_PRE_EPOCH, // not a ticket: a monotonic launch epoch that publishes pre
+    GGML_CUDA_TICKET_COUNT,
+};
+
+// Zero-at-rest counter for ggml_cuda_block_ticket on the current stream of ctx (an _EPOCH slot only
+// ever increments instead).
+unsigned int * ggml_cuda_ticket_counter(ggml_backend_cuda_context & ctx, ggml_cuda_ticket_slot slot);
 
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;

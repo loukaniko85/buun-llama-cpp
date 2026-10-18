@@ -171,7 +171,8 @@ private:
         ggml_backend_t backend = nullptr;
     };
 
-    std::map<std::tuple<ggml_backend_dev_t, int32_t, int32_t>, copy_graph_entry>
+    // one graph per device holding recurrent layers, keyed by (src, dst) cell
+    std::map<std::pair<int32_t, int32_t>, std::vector<copy_graph_entry>>
         copy_graph_cache_;
 
     bool resize(uint32_t new_mem_size);

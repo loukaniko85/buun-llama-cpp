@@ -24,7 +24,7 @@ static void test_resolved_session() {
         // Backend count is deliberately not eligibility: no provider means no
         // packing even for a multi-backend CPU/accelerator configuration.
         check(!ggml_backend_sched_has_moe_cache(sched));
-        ggml_backend_sched_set_moe_cache(sched, GGML_MOE_CACHE_MODE_AUTO, 0, 0, -2, nullptr);
+        ggml_backend_sched_set_moe_cache(sched, GGML_MOE_CACHE_MODE_AUTO, 0, 0, 0, -2, nullptr);
         check(!ggml_backend_sched_has_moe_cache(sched));
         ggml_moe_cache.query_config = [](int, size_t, ggml_moe_cache_config *) { return 1; };
         ggml_moe_cache.session_create = [](void * const *, int, const ggml_moe_cache_config *) -> void * {
@@ -32,18 +32,18 @@ static void test_resolved_session() {
             return &session;
         };
         ggml_moe_cache.session_destroy = [](void *) {};
-        ggml_backend_sched_set_moe_cache(sched, GGML_MOE_CACHE_MODE_AUTO, 0, 0, -2, nullptr);
+        ggml_backend_sched_set_moe_cache(sched, GGML_MOE_CACHE_MODE_AUTO, 0, 0, 0, -2, nullptr);
         check(ggml_backend_sched_has_moe_cache(sched));
-        ggml_backend_sched_set_moe_cache(sched, GGML_MOE_CACHE_MODE_OFF, 0, 0, -2, nullptr);
+        ggml_backend_sched_set_moe_cache(sched, GGML_MOE_CACHE_MODE_OFF, 0, 0, 0, -2, nullptr);
         check(!ggml_backend_sched_has_moe_cache(sched));
         ggml_moe_cache.query_config = [](int, size_t, ggml_moe_cache_config *) { return 0; };
-        ggml_backend_sched_set_moe_cache(sched, GGML_MOE_CACHE_MODE_AUTO, 0, 0, -2, nullptr);
+        ggml_backend_sched_set_moe_cache(sched, GGML_MOE_CACHE_MODE_AUTO, 0, 0, 0, -2, nullptr);
         check(!ggml_backend_sched_has_moe_cache(sched));
         ggml_moe_cache.query_config = [](int, size_t, ggml_moe_cache_config *) { return 1; };
         ggml_moe_cache.session_create = [](void * const *, int, const ggml_moe_cache_config *) -> void * {
             return nullptr;
         };
-        ggml_backend_sched_set_moe_cache(sched, GGML_MOE_CACHE_MODE_AUTO, 0, 0, -2, nullptr);
+        ggml_backend_sched_set_moe_cache(sched, GGML_MOE_CACHE_MODE_AUTO, 0, 0, 0, -2, nullptr);
         check(!ggml_backend_sched_has_moe_cache(sched));
         ggml_backend_sched_free(sched);
         ggml_moe_cache = {};

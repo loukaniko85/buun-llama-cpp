@@ -203,6 +203,7 @@ typedef void * thread_ret_t;
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #endif
 
@@ -617,6 +618,7 @@ struct ggml_numa_nodes {
     uint32_t n_nodes;
     uint32_t total_cpus; // hardware threads on system
     uint32_t current_node; // node on which main process is execting
+    uint8_t cpu_node[GGML_NUMA_MAX_CPUS]; // node of each hardware thread
 #if defined(__gnu_linux__)
     cpu_set_t cpuset; // cpuset from numactl
 #else
@@ -761,6 +763,7 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
             GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
             if (stat(path, &st) == 0) {
                 node->cpus[node->n_cpus++] = c;
+                g_state.numa.cpu_node[c] = (uint8_t) n;
                 GGML_PRINT_DEBUG(" %u", c);
             }
         }
@@ -785,6 +788,145 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
 bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
+}
+
+static bool ggml_numa_experts(void) {
+    return g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_EXPERTS && ggml_is_numa();
+}
+
+// the experts strategy leaves worker threads unpinned
+static bool ggml_numa_pins_threads(void) {
+    return ggml_is_numa() && !ggml_numa_experts();
+}
+
+// every expert's rows are split into this many equal parts, part k homed on node k
+static int ggml_numa_expert_parts(void) {
+    return ggml_numa_experts() ? (int) g_state.numa.n_nodes : 1;
+}
+
+// first row of part `part` of an expert with n_rows rows; part n_parts is the end
+static int64_t ggml_numa_expert_part_row(int64_t n_rows, int part) {
+    return n_rows * part / ggml_numa_expert_parts();
+}
+
+static int ggml_numa_current_node(void) {
+#if defined(__gnu_linux__)
+    const int cpu = sched_getcpu();
+    return cpu >= 0 && (uint32_t) cpu < g_state.numa.total_cpus ? g_state.numa.cpu_node[cpu] : 0;
+#else
+    return 0;
+#endif
+}
+
+#if defined(__gnu_linux__)
+// the kernel intersects the node mask with the allowed CPUs, so this only fails when none remain
+static int ggml_numa_pin_to_node(uint32_t node_num) {
+    const struct ggml_numa_node * node = &g_state.numa.nodes[node_num];
+    const size_t setsize = CPU_ALLOC_SIZE(g_state.numa.total_cpus);
+    cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
+    CPU_ZERO_S(setsize, cpus);
+    for (size_t i = 0; i < node->n_cpus; ++i) {
+        CPU_SET_S(node->cpus[i], setsize, cpus);
+    }
+    const int rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
+    CPU_FREE(cpus);
+    return rv;
+}
+
+struct ggml_numa_place_state {
+    int fd;
+    size_t offset;
+    size_t row_size;
+    int64_t n_rows;
+    int64_t n_expert;
+    atomic_int next[GGML_NUMA_MAX_NODES];
+    atomic_bool unpinned;
+};
+
+struct ggml_numa_place_worker {
+    struct ggml_numa_place_state * state;
+    uint32_t node;
+};
+
+static void * ggml_numa_place_thread(void * data) {
+    const struct ggml_numa_place_worker * w = data;
+    struct ggml_numa_place_state * s = w->state;
+    // a read off the home node would first-touch the pages onto the wrong node
+    if (ggml_numa_pin_to_node(w->node) != 0) {
+        atomic_store(&s->unpinned, true);
+        return NULL;
+    }
+
+    const size_t buf_size = 4u << 20;
+    char * buf = malloc(buf_size);
+    if (buf == NULL) {
+        return NULL;
+    }
+    // first touch: the page cache pages a read allocates land on the reading thread's node
+    const size_t part_beg = s->row_size * ggml_numa_expert_part_row(s->n_rows, w->node);
+    const size_t part_end = s->row_size * ggml_numa_expert_part_row(s->n_rows, w->node + 1);
+    for (;;) {
+        const int64_t e = atomic_fetch_add(&s->next[w->node], 1);
+        if (e >= s->n_expert) {
+            break;
+        }
+        const size_t beg = s->offset + (size_t) e * s->row_size * s->n_rows;
+        for (size_t off = part_beg; off < part_end; off += buf_size) {
+            const size_t n = MIN(buf_size, part_end - off);
+            if (pread(s->fd, buf, n, (off_t) (beg + off)) <= 0) {
+                break;
+            }
+        }
+    }
+    free(buf);
+    return NULL;
+}
+#endif
+
+bool ggml_numa_place_experts(int fd, size_t offset, size_t row_size, int64_t n_rows, int64_t n_expert) {
+    const size_t expert_size = row_size * n_rows;
+    if (!ggml_numa_experts() || expert_size == 0 || n_expert < 2) {
+        return false;
+    }
+#if defined(__gnu_linux__)
+    // A private open file description, so its readahead state is ours: readahead past an
+    // expert's end would first-touch the next expert's pages from the wrong node.
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+    struct ggml_numa_place_state state = { .fd = open(path, O_RDONLY), .offset = offset,
+        .row_size = row_size, .n_rows = n_rows, .n_expert = n_expert };
+    if (state.fd < 0) {
+        return false;
+    }
+    // drops only pages no process maps, so the experts must not have been touched yet
+    posix_fadvise(state.fd, (off_t) offset, (off_t) (expert_size * n_expert), POSIX_FADV_DONTNEED);
+    posix_fadvise(state.fd, 0, 0, POSIX_FADV_RANDOM);
+
+    // the reads are I/O bound; a few threads per node keep the device queue full
+    enum { THREADS_PER_NODE = 8 };
+    pthread_t threads[GGML_NUMA_MAX_NODES * THREADS_PER_NODE];
+    struct ggml_numa_place_worker workers[GGML_NUMA_MAX_NODES * THREADS_PER_NODE];
+    int n_threads = 0;
+    for (uint32_t n = 0; n < g_state.numa.n_nodes; ++n) {
+        const struct ggml_numa_node * node = &g_state.numa.nodes[n];
+        for (uint32_t i = 0; i < MIN(node->n_cpus, (uint32_t) THREADS_PER_NODE); ++i) {
+            workers[n_threads] = (struct ggml_numa_place_worker) { &state, n };
+            if (ggml_thread_create(&threads[n_threads], NULL, ggml_numa_place_thread, &workers[n_threads]) == 0) {
+                n_threads++;
+            }
+        }
+    }
+    for (int i = 0; i < n_threads; ++i) {
+        ggml_thread_join(threads[i], NULL);
+    }
+    close(state.fd);
+    return n_threads > 0 && !atomic_load(&state.unpinned);
+#else
+    GGML_UNUSED(fd);
+    GGML_UNUSED(offset);
+    GGML_UNUSED(n_rows);
+    return false;
+#endif
 }
 
 #if defined(__ARM_ARCH)
@@ -2227,7 +2369,7 @@ UseGgmlGemm2:;
     // If the chunking is poor for the number of threads on this setup, scrap the whole plan.  Re-chunk it by thread.
     //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggml-org/llama.cpp/pull/6915
     //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
-    if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
+    if (nchunk0 * nchunk1 < nth * 4 || ggml_numa_pins_threads()) {
         // distribute the thread work across the inner or outer loop based on which one is larger
         nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
         nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
@@ -2447,11 +2589,14 @@ static void ggml_compute_forward_mul_mat_id_impl(
     struct mmid_row_mapping * matrix_rows = // [n_as][ids->ne[0]*ids->ne[1]]
         incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
 
-    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as + 1]
-        incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * (n_as + 1), CACHE_LINE_SIZE);
+    // one chunk counter per (expert, row part)
+    const int n_parts = ggml_numa_expert_parts();
+    const int n_ctr = n_as * n_parts;
+    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_ctr + 1]
+        incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * (n_ctr + 1), CACHE_LINE_SIZE);
 
     // published by thread 0 before the row barrier
-    int * t0_reserved = (int *) atomic_current_chunk[n_as];
+    int * t0_reserved = (int *) atomic_current_chunk[n_ctr];
 
     // The panel fallback and tiled path are mutually exclusive for each expert.
     const bool iqp = !params->use_ref && ggml_cpu_iqp_supports_mul_mat_id(dst);
@@ -2579,8 +2724,8 @@ static void ggml_compute_forward_mul_mat_id_impl(
     }
 
     // reset current_chunk
-    for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
-        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+    for (int ctr = ith; ctr < n_ctr; ctr += nth) {
+        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + ctr);
         *current_chunk_ctr = nth;
     }
 
@@ -2608,6 +2753,16 @@ static void ggml_compute_forward_mul_mat_id_impl(
     struct ggml_compute_params tiled_params = *params;
     tiled_params.nth = nw;
     tiled_params.ith = iw;
+
+    // NUMA experts: a worker takes the chunks of its own node's row part of an expert first,
+    // then helps with the other parts. Every chunk is then claimed from the part's counter.
+    const int numa_node = n_parts > 1 ? ggml_numa_current_node() : 0;
+    // chunks 0..n_static-1 are taken by worker index without the counter; the counter starts at nth
+    const int n_static = n_parts > 1 ? 0 : nw;
+    // a part's chunks are sized for one node's share of the workers
+    const int nw_split = MAX(1, nw / n_parts);
+    // disable for the NUMA strategies that pin threads
+    const bool disable_chunking = ggml_numa_pins_threads();
 
     for (int cur_a = 0; cur_a < n_as && iw >= 0; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
@@ -2640,63 +2795,67 @@ static void ggml_compute_forward_mul_mat_id_impl(
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
-
-        const int64_t nr0 = ne01;
         const int64_t nr1 = cne1;
 
-        int chunk_size = 16;
-        if (nr0 == 1 || nr1 == 1) {
-            chunk_size = 64;
-        }
+        for (int pass = 0; pass < n_parts; ++pass) {
+            const int part = (numa_node + pass) % n_parts;
 
-        // disable for NUMA
-        const bool disable_chunking = ggml_is_numa();
+            // the rows ggml_numa_place_experts homed on node `part`
+            const int64_t r0 = ggml_numa_expert_part_row(ne01, part);
+            const int64_t nr0 = ggml_numa_expert_part_row(ne01, part + 1) - r0;
 
-        int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
-        int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
+            int chunk_size = 16;
+            if (nr0 == 1 || nr1 == 1) {
+                chunk_size = 64;
+            }
 
-        if (nchunk0 * nchunk1 < nw * 4 || disable_chunking) {
-            nchunk0 = nr0 > nr1 ? nw : 1;
-            nchunk1 = nr0 > nr1 ? 1 : nw;
-        }
+            int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
+            int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
 
-        const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
-        const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+            if (nchunk0 * nchunk1 < nw_split * 4 || disable_chunking) {
+                nchunk0 = nr0 > nr1 ? nw_split : 1;
+                nchunk1 = nr0 > nr1 ? 1 : nw_split;
+            }
 
-        int current_chunk = iw;
+            const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+            const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
-        atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+            atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a * n_parts + part);
 
-        while (current_chunk < nchunk0 * nchunk1) {
-            const int64_t ith0 = current_chunk % nchunk0;
-            const int64_t ith1 = current_chunk / nchunk0;
+            int current_chunk = n_static
+                ? iw : atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed) - nth;
 
-            const int64_t ir0_start = dr0 * ith0;
-            const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
+            while (current_chunk < nchunk0 * nchunk1) {
+                const int64_t ith0 = current_chunk % nchunk0;
+                const int64_t ith1 = current_chunk / nchunk0;
 
-            const int64_t ir1_start = dr1 * ith1;
-            const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
+                const int64_t ir0_start = r0 + dr0 * ith0;
+                const int64_t ir0_end = MIN(ir0_start + dr0, r0 + nr0);
 
-            ggml_compute_forward_mul_mat_id_one_chunk(
-                dst, src0, src1, ids, cur_a,
-                ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata
-            );
-            if (paired_dst) {
-                const struct ggml_tensor * paired_weight = paired_dst->src[0];
+                const int64_t ir1_start = dr1 * ith1;
+                const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
+
                 ggml_compute_forward_mul_mat_id_one_chunk(
-                        paired_dst, paired_weight, src1, ids, cur_a,
-                        ir0_start, ir0_end, ir1_start, ir1_end,
-                        (const char *) paired_weight->data + cur_a*paired_weight->nb[2],
-                        matrix_rows, row_size, src1_cont, wdata);
-            }
+                    dst, src0, src1, ids, cur_a,
+                    ir0_start, ir0_end, ir1_start, ir1_end,
+                    src0_cur, matrix_rows, row_size, src1_cont, wdata
+                );
+                if (paired_dst) {
+                    const struct ggml_tensor * paired_weight = paired_dst->src[0];
+                    ggml_compute_forward_mul_mat_id_one_chunk(
+                            paired_dst, paired_weight, src1, ids, cur_a,
+                            ir0_start, ir0_end, ir1_start, ir1_end,
+                            (const char *) paired_weight->data + cur_a*paired_weight->nb[2],
+                            matrix_rows, row_size, src1_cont, wdata);
+                }
 
-            if (nw >= nchunk0 * nchunk1) {
-                break;
-            }
+                if (n_static >= nchunk0 * nchunk1) {
+                    break;
+                }
 
-            // the counter starts at nth; chunks nw..nth-1 are not claimed initially when reserved
-            current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed) - (nth - nw);
+                current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed) -
+                    (nth - n_static);
+            }
         }
     }
 
@@ -3210,7 +3369,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
 // Android's libc implementation "bionic" does not support setting affinity
 #if defined(__gnu_linux__)
 static void set_numa_thread_affinity(int thread_n) {
-    if (!ggml_is_numa()) {
+    if (!ggml_numa_pins_threads()) {
         return;
     }
 
@@ -3238,24 +3397,14 @@ static void set_numa_thread_affinity(int thread_n) {
             return;
     }
 
-    struct ggml_numa_node * node = &g_state.numa.nodes[node_num];
-
-    cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
-    CPU_ZERO_S(setsize, cpus);
-    for (size_t i = 0; i < node->n_cpus; ++i) {
-        CPU_SET_S(node->cpus[i], setsize, cpus);
-    }
-
-    rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
+    rv = ggml_numa_pin_to_node(node_num);
     if (rv) {
             fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n", strerror(rv));
     }
-
-    CPU_FREE(cpus);
 }
 
 static void clear_numa_thread_affinity(void) {
-    if (!ggml_is_numa()) {
+    if (!ggml_numa_pins_threads()) {
         return;
     }
 
@@ -3956,7 +4105,7 @@ struct ggml_cplan ggml_graph_plan(
                         // matrix_rows
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk + shared schedule line
-                        cur += CACHE_LINE_SIZE*(n_as + 1) + CACHE_LINE_SIZE;
+                        cur += CACHE_LINE_SIZE*(n_as*ggml_numa_expert_parts() + 1) + CACHE_LINE_SIZE;
                         const size_t panel_size = ggml_cpu_iqp_supports_mul_mat_id(node)
                             ? n_tasks * ggml_cpu_iqp_scratch_size(node) : 0;
                         cur += MAX(panel_size, ggml_tiled_wdata_size(n_tasks, node)) + 64;

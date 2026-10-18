@@ -51,6 +51,209 @@ void ggml_cuda_op_qwen35_recurrent_gates_f16(
         static_cast<float *>(beta->data), alpha_weight->ne[0], alpha_weight->ne[1]);
 }
 
+struct mmvf_f16_multi_args {
+    const half * w[MMVF_F16_MULTI_MAX];
+    float      * dst[MMVF_F16_MULTI_MAX];
+    float      * sigmoid_dst; // optional sigmoid of the last dst, same layout
+    int64_t      stride_w[MMVF_F16_MULTI_MAX];   // halves per row
+    int64_t      stride_dst[MMVF_F16_MULTI_MAX]; // floats per token
+    int          row_end[MMVF_F16_MULTI_MAX];    // cumulative row count
+};
+
+// One warp per output row over the concatenated rows of all matrices; x is read once per warp from L1/L2.
+template <int n_mats, int n_tokens>
+static __global__ void mul_mat_vec_f16_multi(
+        const mmvf_f16_multi_args args, const float * __restrict__ x, const int64_t stride_x, const int ncols) {
+    const int row  = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (row >= args.row_end[n_mats - 1]) {
+        return;
+    }
+    int m = 0;
+#pragma unroll
+    for (int k = 0; k < n_mats - 1; ++k) {
+        m += row >= args.row_end[k];
+    }
+    const int local = row - (m == 0 ? 0 : args.row_end[m - 1]);
+    const half * w = args.w[m] + local * args.stride_w[m];
+
+    float sum[n_tokens] = { 0.0f };
+    mmvf_f16_row_dot<n_tokens>(w, x, stride_x, ncols, lane, sum);
+#pragma unroll
+    for (int t = 0; t < n_tokens; ++t) {
+        const float s = warp_reduce_sum(sum[t]);
+        if (lane == 0) {
+            const int64_t index = t * args.stride_dst[m] + local;
+            args.dst[m][index] = s;
+            if (m == n_mats - 1 && args.sigmoid_dst) {
+                args.sigmoid_dst[index] = ggml_cuda_op_sigmoid_single(s);
+            }
+        }
+    }
+}
+
+bool ggml_cuda_mul_mat_vec_f16_multi_supported(const ggml_tensor * mm, const ggml_tensor * src1) {
+    const ggml_tensor * src0 = mm->src[0];
+    return mm->op == GGML_OP_MUL_MAT && mm->src[1] == src1 &&
+        src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
+        src0->ne[0] == src1->ne[0] && src0->ne[0] % 8 == 0 && src0->nb[0] == sizeof(half) &&
+        src0->nb[1] % 16 == 0 && (uintptr_t) src0->data % 16 == 0 &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 &&
+        src1->ne[1] >= 1 && src1->ne[1] <= MMVF_F16_MULTI_MAX_TOKENS && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        src1->nb[0] == sizeof(float) && src1->nb[1] % 16 == 0 && (uintptr_t) src1->data % 16 == 0 &&
+        mm->nb[0] == sizeof(float);
+}
+
+template <int n_mats>
+static void mul_mat_vec_f16_multi_launch(const mmvf_f16_multi_args & args, const float * x, int64_t stride_x,
+        int ncols, int n_tokens, cudaStream_t stream) {
+    constexpr int warps = 2;
+    const dim3 grid((args.row_end[n_mats - 1] + warps - 1) / warps);
+    const dim3 block(warps * WARP_SIZE);
+    switch (n_tokens) {
+        case 1: mul_mat_vec_f16_multi<n_mats, 1><<<grid, block, 0, stream>>>(args, x, stride_x, ncols); break;
+        case 2: mul_mat_vec_f16_multi<n_mats, 2><<<grid, block, 0, stream>>>(args, x, stride_x, ncols); break;
+        case 3: mul_mat_vec_f16_multi<n_mats, 3><<<grid, block, 0, stream>>>(args, x, stride_x, ncols); break;
+        case 4: mul_mat_vec_f16_multi<n_mats, 4><<<grid, block, 0, stream>>>(args, x, stride_x, ncols); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+void ggml_cuda_mul_mat_vec_f16_multi(ggml_backend_cuda_context & ctx, ggml_tensor * const * mms, int n_mats,
+        const ggml_tensor * sigmoid) {
+    GGML_ASSERT(n_mats >= 2 && n_mats <= MMVF_F16_MULTI_MAX);
+    const ggml_tensor * src1 = mms[0]->src[1];
+    mmvf_f16_multi_args args = {};
+    int rows = 0;
+    for (int k = 0; k < n_mats; ++k) {
+        const ggml_tensor * src0 = mms[k]->src[0];
+        rows += src0->ne[1];
+        args.w[k]          = static_cast<const half *>(src0->data);
+        args.dst[k]        = static_cast<float *>(mms[k]->data);
+        args.stride_w[k]   = src0->nb[1] / sizeof(half);
+        args.stride_dst[k] = mms[k]->nb[1] / sizeof(float);
+        args.row_end[k]    = rows;
+    }
+    if (sigmoid) {
+        args.sigmoid_dst = static_cast<float *>(sigmoid->data);
+    }
+    const float * x = static_cast<const float *>(src1->data);
+    const int64_t stride_x = src1->nb[1] / sizeof(float);
+    const int ncols = src1->ne[0];
+    const int n_tokens = src1->ne[1];
+    switch (n_mats) {
+        case 2: mul_mat_vec_f16_multi_launch<2>(args, x, stride_x, ncols, n_tokens, ctx.stream()); break;
+        case 3: mul_mat_vec_f16_multi_launch<3>(args, x, stride_x, ncols, n_tokens, ctx.stream()); break;
+        case 4: mul_mat_vec_f16_multi_launch<4>(args, x, stride_x, ncols, n_tokens, ctx.stream()); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+struct mmvf_kda_gate_args {
+    const half  * w[2];
+    const float * x[2];
+    float       * dst[2];
+    int64_t       stride_w[2];   // halves per row
+    int64_t       stride_x[2];   // floats per token
+    int64_t       stride_dst[2]; // floats per token
+    int           rows0;
+    int           rows;
+    const float * bias;
+    const float * a;
+    int           head_dim;
+    float         s0, b0, s1, b1;
+};
+
+// One warp per output row; rows [0, rows0) get the gate epilogue, the rest of matrix 1 is a plain product.
+template <int n_tokens>
+static __global__ void mul_mat_vec_f16_kda_gate(const mmvf_kda_gate_args args, const int ncols) {
+    const int row  = blockIdx.x * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    const int lane = threadIdx.x % WARP_SIZE;
+    if (row >= args.rows) {
+        return;
+    }
+    const int m     = row >= args.rows0;
+    const int local = m ? row - args.rows0 : row;
+    const half  * w = args.w[m] + local * args.stride_w[m];
+    const float * x = args.x[m];
+
+    float sum[n_tokens] = { 0.0f };
+    for (int c = lane * 4; c < ncols; c += WARP_SIZE * 4) {
+        const int2 raw = *reinterpret_cast<const int2 *>(w + c);
+        const half2 * h = reinterpret_cast<const half2 *>(&raw);
+        const float2 w0 = __half22float2(h[0]);
+        const float2 w1 = __half22float2(h[1]);
+#pragma unroll
+        for (int t = 0; t < n_tokens; ++t) {
+            const float4 xv = *reinterpret_cast<const float4 *>(x + t * args.stride_x[m] + c);
+            sum[t] += w0.x * xv.x + w0.y * xv.y + w1.x * xv.z + w1.y * xv.w;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < n_tokens; ++t) {
+        float v = warp_reduce_sum(sum[t]);
+        if (lane != 0) {
+            continue;
+        }
+        if (m == 0) {
+            // same operations and order as the ADD, MUL, SCALE, SIGMOID, SCALE nodes
+            v = (v + args.bias[local]) * args.a[local / args.head_dim];
+            v = args.s0 * v + args.b0;
+            v = ggml_cuda_op_sigmoid_single(v);
+            v = args.s1 * v + args.b1;
+        }
+        args.dst[m][t * args.stride_dst[m] + local] = v;
+    }
+}
+
+bool ggml_cuda_mul_mat_vec_f16_kda_gate_supported(const ggml_tensor * mm) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    return mm->op == GGML_OP_MUL_MAT && src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 &&
+        mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm) &&
+        src0->ne[0] % 4 == 0 && src0->nb[0] == sizeof(half) && src0->nb[1] % 8 == 0 && (uintptr_t) src0->data % 8 == 0 &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 &&
+        src1->ne[1] >= 1 && src1->ne[1] <= MMVF_F16_MULTI_MAX_TOKENS && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        src1->nb[0] == sizeof(float) && src1->nb[1] % 16 == 0 && (uintptr_t) src1->data % 16 == 0;
+}
+
+void ggml_cuda_mul_mat_vec_f16_kda_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * mm,
+        const ggml_tensor * bias, const ggml_tensor * a, const ggml_tensor * scale0, ggml_tensor * g1, ggml_tensor * mm2) {
+    mmvf_kda_gate_args args = {};
+    const ggml_tensor * mms[2] = { mm, mm2 };
+    float * dsts[2] = { static_cast<float *>(g1->data), mm2 ? static_cast<float *>(mm2->data) : nullptr };
+    for (int k = 0; k < (mm2 ? 2 : 1); ++k) {
+        args.w[k]          = static_cast<const half *>(mms[k]->src[0]->data);
+        args.x[k]          = static_cast<const float *>(mms[k]->src[1]->data);
+        args.dst[k]        = dsts[k];
+        args.stride_w[k]   = mms[k]->src[0]->nb[1] / sizeof(half);
+        args.stride_x[k]   = mms[k]->src[1]->nb[1] / sizeof(float);
+        // the gate output is contiguous but may be shaped per head
+        args.stride_dst[k] = k == 0 ? mm->ne[0] : mms[k]->nb[1] / sizeof(float);
+        args.rows         += mms[k]->ne[0];
+    }
+    args.rows0    = mm->ne[0];
+    args.bias     = static_cast<const float *>(bias->data);
+    args.a        = static_cast<const float *>(a->data);
+    args.head_dim = mm->ne[0] / ggml_nelements(a);
+    args.s0       = ggml_get_op_params_f32(scale0, 0);
+    args.b0       = ggml_get_op_params_f32(scale0, 1);
+    args.s1       = ggml_get_op_params_f32(g1, 0);
+    args.b1       = ggml_get_op_params_f32(g1, 1);
+
+    constexpr int warps = 4;
+    const dim3 grid((args.rows + warps - 1) / warps);
+    const dim3 block(warps * WARP_SIZE);
+    const int ncols = mm->src[0]->ne[0];
+    switch (mm->ne[1]) {
+        case 1: mul_mat_vec_f16_kda_gate<1><<<grid, block, 0, ctx.stream()>>>(args, ncols); break;
+        case 2: mul_mat_vec_f16_kda_gate<2><<<grid, block, 0, ctx.stream()>>>(args, ncols); break;
+        case 3: mul_mat_vec_f16_kda_gate<3><<<grid, block, 0, ctx.stream()>>>(args, ncols); break;
+        case 4: mul_mat_vec_f16_kda_gate<4><<<grid, block, 0, ctx.stream()>>>(args, ncols); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
 template <int block_size, int fixed_ncols = 0>
 static __global__ void qwen35_recurrent_gates_bf16(
         const nv_bfloat16 * alpha_weight, const nv_bfloat16 * beta_weight,
@@ -837,11 +1040,17 @@ static bool mul_mat_vec_f_try_short_rows(
         const int64_t nsamples_x, const int64_t nsamples_dst,
         const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst, cudaStream_t stream) {
     constexpr int64_t vals = 16/sizeof(T);
-    // Long rows already fill a block; few rows would leave most SMs idle with one warp per row.
+    // Long rows already fill a block; few rows (across all channels/samples) would leave most SMs idle
+    // with one warp per row.
     if (ids || fusion.gate || fusion.x_bias || fusion.gate_bias ||
-            ncols*(int64_t) sizeof(T) > 2048 || ncols % vals != 0 || nrows < 1024 ||
+            ncols*(int64_t) sizeof(T) > 2048 || ncols % vals != 0 || nrows*nchannels_dst*nsamples_dst < 1024 ||
             (uintptr_t) x % 16 != 0 || stride_row % vals != 0 || stride_channel_x % vals != 0 || stride_sample_x % vals != 0 ||
             (uintptr_t) y % 16 != 0 || stride_col_y % 4 != 0 || stride_channel_y % 4 != 0 || stride_sample_y % 4 != 0) {
+        return false;
+    }
+    // the kernel takes its strides, and the column offsets they scale, as int
+    if (std::max({stride_row, stride_channel_x, stride_sample_x, stride_channel_y, stride_sample_y,
+            stride_channel_dst, stride_sample_dst, ncols_dst*stride_col_y, ncols_dst*stride_col_dst}) > INT_MAX) {
         return false;
     }
 #define MMVF_SHORT_ROWS_CASE(n) \

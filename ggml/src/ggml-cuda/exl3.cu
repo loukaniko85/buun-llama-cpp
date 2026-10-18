@@ -32,7 +32,9 @@
 #include "exl3-gemv.cuh"
 #include "exl3-gemv-int8.cuh"
 #include "exl3-int8-warpk.cuh"
+#include "exl3-moe-fused.cuh"
 #include "moe-cache.cuh"
+#include "moe-tier.cuh"
 #if !defined(GGML_USE_HIP)
 #include "exl3-gemm.cuh"
 #include "exl3-head.cuh"
@@ -311,10 +313,10 @@ static void exl3_warpk_launch(ggml_backend_cuda_context & ctx, const uint8_t * w
 
 // One launch = grid (n/256, ksplit, pairs); dense calls pass pairs = 1 with M tokens, the grouped
 // MoE path M = 1 with one (token, expert) pair per block-z.
-template <int bits, int cb, int M, bool RESID, bool GROUPED>
+template <int bits, int cb, int M, bool RESID, bool GROUPED, bool GLU = false>
 void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, const float * x, const half * suh, const half * svh,
-        float * y, int k, int n, int pairs, exl3_int8::grouped_args ga, cudaStream_t stream) {
-    const auto kernel = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, GROUPED>;
+        float * y, int k, int n, int pairs, exl3_int8::grouped_args ga, cudaStream_t stream, exl3_int8::glu_args glu = {}) {
+    const auto kernel = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, GROUPED, false, exl3_int8::input_mode::inline_quantize, GLU>;
     const size_t cap = M > exl3_int8::MAX_M
         ? std::min(exl3_int8_smem_cap(ctx.device),
                 size_t(ggml_cuda_info().devices[ctx.device].smpbo) - size_t(M) * exl3_int8::COLS * sizeof(float) - 4096)
@@ -343,7 +345,7 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
         }
     }
     GGML_ASSERT(smem <= cap);
-    if constexpr (cb == 2 && !GROUPED && ((bits == 4 && !RESID && M >= 4 && M <= 8) || (bits == 6 && RESID && M >= 5 && M <= 8))) {
+    if constexpr (cb == 2 && !GLU && !GROUPED && ((bits == 4 && !RESID && M >= 4 && M <= 8) || (bits == 6 && RESID && M >= 5 && M <= 8))) {
         if (exl3_sm86_available(ggml_cuda_info().devices[ctx.device].cc) && exl3_warpk_shape(bits, RESID, n, ksplit)) {
             exl3_warpk_launch<bits, RESID, false>(ctx, B, x, suh, svh, y, k, n, nrows, ksplit, M);
             return;
@@ -351,7 +353,7 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
     }
     ggml_cuda_pool_alloc<float> partials(ctx.pool(), size_t(ksplit) * M * pairs * n);
     int * counters = exl3_int8_counters(ctx);
-    if constexpr (cb == 2 && bits == 6 && M >= 3 && M <= 8 && RESID && !GROUPED) {
+    if constexpr (cb == 2 && bits == 6 && M >= 3 && M <= 8 && RESID && !GROUPED && !GLU) {
         if (exl3_sm86_available(ggml_cuda_info().devices[ctx.device].cc)) {
             const auto prepare = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, false, false, exl3_int8::input_mode::prepare>;
             const auto consume = exl3_int8::gemv_int8_kernel<bits, cb, M, RESID, false, false, exl3_int8::input_mode::consume>;
@@ -363,15 +365,15 @@ void exl3_gemv_int8_launch(ggml_backend_cuda_context & ctx, const uint8_t * B, c
             }
             ggml_cuda_pool_alloc<uint8_t> prepared(ctx.pool(), size_t(ksplit) * (2 * nacc * sizeof(uint32_t) + nacc * nrows * 16));
             prepare<<<dim3(1, ksplit), exl3_int8::THREADS, smem, stream>>>(
-                B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, prepared.get());
+                B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, prepared.get(), {});
             const size_t consume_smem = size_t(nacc) * nrows * 16 + exl3_int8::head_stage_bytes(bits);
             consume<<<dim3(colblocks, ksplit), exl3_int8::THREADS, consume_smem, stream>>>(
-                B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, prepared.get());
+                B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, prepared.get(), {});
             return;
         }
     }
     kernel<<<dim3(colblocks, ksplit, pairs), exl3_int8::THREADS, smem, stream>>>(
-        B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, nullptr);
+        B, x, suh, svh, y, partials.get(), counters, k, n, nrows, ga, {}, nullptr, glu);
 }
 
 template <int bits, bool RESID>
@@ -472,7 +474,7 @@ static bool exl3_int8_bundle_launch(ggml_backend_cuda_context & ctx, ggml_tensor
     kernel<<<c0 * s0 + c1 * s1, exl3_int8::THREADS, std::max(sm0, sm1), ctx.stream()>>>(
         static_cast<const uint8_t *>(a->src[0]->data), static_cast<const float *>(a->src[1]->data),
         static_cast<const half *>(a->src[3]->data), static_cast<const half *>(a->src[2]->data),
-        static_cast<float *>(a->data), partials.get(), counters, k, n0, r0, {}, args, nullptr);
+        static_cast<float *>(a->data), partials.get(), counters, k, n0, r0, {}, args, nullptr, {});
     return true;
 }
 
@@ -707,6 +709,41 @@ void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor *
     exl3_had_out_kernel<<<dim3(n / 128, m), 32, 0, stream>>>(y, svh, n);
 }
 
+bool ggml_cuda_mul_mat_exl3_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * glu, ggml_tensor * dst,
+        const ggml_tensor * residual, ggml_tensor * sum) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    if (!ggml_cuda_exl3_supports_mul_mat(dst) || dst->src[1] != glu || dst->src[2] == nullptr || dst->src[3] == nullptr ||
+            glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU_CLAMP || up == nullptr ||
+            ggml_get_op_params_i32(glu, 1) != 0 || gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(gate) || !ggml_is_contiguous(up) ||
+            !ggml_are_same_shape(gate, glu) || !ggml_are_same_shape(up, glu)) {
+        return false;
+    }
+    const int k = int(src0->ne[0]);
+    const int n = int(src0->ne[1]);
+    const int bits = ggml_cuda_exl3_bits(src0->type);
+    // Single-row plain int8 only: the one executor the int8 path reaches for these shapes.
+    if (glu->ne[1] != 1 || ggml_cuda_exl3_codebook(src0->type) != 2 || strcmp(src0->name, "output.weight") == 0 ||
+            !exl3_int8_applicable(bits, 1, k, n, ggml_cuda_info().devices[ctx.device].cc) || exl3_int8_resid(bits, false)) {
+        return false;
+    }
+    const uint8_t * B = static_cast<const uint8_t *>(src0->data);
+    const float * x = static_cast<const float *>(gate->data);
+    const half * suh = static_cast<const half *>(dst->src[3]->data);
+    const half * svh = static_cast<const half *>(dst->src[2]->data);
+    float * y = static_cast<float *>(sum ? sum->data : dst->data);
+    const exl3_int8::glu_args args { static_cast<const float *>(up->data), ggml_get_op_params_f32(glu, 3),
+        sum ? static_cast<const float *>(residual->data) : nullptr };
+    switch (bits) {
+#define EXL3_GLU_CASE(K) case K: exl3_gemv_int8_launch<K, 2, 1, false, false, true>(ctx, B, x, suh, svh, y, k, n, 1, {}, ctx.stream(), args); return true;
+        EXL3_GLU_CASE(2) EXL3_GLU_CASE(3) EXL3_GLU_CASE(4) EXL3_GLU_CASE(5) EXL3_GLU_CASE(6)
+#undef EXL3_GLU_CASE
+        default: return false;
+    }
+}
+
 bool ggml_cuda_exl3_mul_mat_id_fast(const ggml_tensor * dst) {
     return exl3_int8_mode() != 0 && exl3_mul_mat_id_fast_shape(dst);
 }
@@ -727,6 +764,7 @@ void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     ga.x_nb2         = x->nb[2] / sizeof(float);
     ga.expert_stride = w->nb[2];
     const void * svh_data = svh->data, * suh_data = suh->data;
+    cudaStream_t stream = ctx.stream();
     ggml_moe_cache_route_table route;
     if (ggml_moe_cache_route_find(w->data, route)) {
         ga.table     = route.table;
@@ -735,11 +773,129 @@ void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             svh_data = route.scales[0];
             suh_data = route.scales[1];
         }
+        ggml_moe_tier_resolve(route, nullptr, ids, x, stream);
     }
     const int pairs = int(ids->ne[0] * ids->ne[1]);
-    cudaStream_t stream = ctx.stream();
     EXL3_DISPATCH(exl3_moe_run, bits, cb, ctx, static_cast<const float *>(x->data), static_cast<const half *>(suh_data),
         static_cast<const uint8_t *>(w->data), static_cast<const half *>(svh_data), static_cast<float *>(dst->data), k, n, pairs, ga, stream);
+}
+
+template <int BG, int BD, int BS>
+static void exl3_moe_fused_launch(ggml_backend_cuda_context & ctx, const exl3_moe_fused::args & a) {
+    const auto kernel = exl3_moe_fused::moe<BG, BD, BS>;
+    static int occ[GGML_CUDA_MAX_DEVICES] = {};
+    if (occ[ctx.device] == 0) {
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ[ctx.device], kernel, exl3_moe_fused::THREADS, 0));
+    }
+    const int grid = occ[ctx.device] * ggml_cuda_info().devices[ctx.device].nsm;
+    kernel<<<grid, exl3_moe_fused::THREADS, 0, ctx.stream()>>>(a);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_exl3_moe_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate,
+        const ggml_tensor * down, float limit, const ggml_tensor * weights, const ggml_tensor * sh_up,
+        const ggml_tensor * sh_gate, const ggml_tensor * sh_down, ggml_tensor * dst, bool dst_aliases_src) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_EXL3_MOE_FUSED");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!enabled || GGML_CUDA_CC_IS_AMD(cc) || cc < GGML_CUDA_CC_AMPERE ||
+            ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE || exl3_int8_mode() == 0) {
+        return false;
+    }
+    const ggml_tensor * wu = up->src[0], * wg = gate->src[0], * wd = down->src[0];
+    const ggml_tensor * x = up->src[1], * ids = up->src[2];
+    const int bg = ggml_cuda_exl3_bits(wg->type), bd = ggml_cuda_exl3_bits(wd->type);
+    const int k1 = int(wg->ne[0]), n1 = int(wg->ne[1]);
+    const int n_used = int(ids->ne[0]), n_tok = int(ids->ne[1]);
+    // shared expert: plain MUL_MATs on the same rows, n1 wide, one bit width
+    const int bs = sh_gate ? ggml_cuda_exl3_bits(sh_gate->src[0]->type) : 0;
+    if (sh_gate) {
+        const ggml_tensor * sx = sh_gate->src[1];
+        for (const ggml_tensor * mm : { sh_up, sh_gate, sh_down }) {
+            if (!ggml_cuda_exl3_supports_mul_mat(mm) || mm->src[2] == nullptr || mm->src[3] == nullptr ||
+                    ggml_cuda_exl3_codebook(mm->src[0]->type) != 2 || ggml_cuda_exl3_bits(mm->src[0]->type) != bs ||
+                    exl3_int8_resid(bs, false)) {
+                return false;
+            }
+        }
+        // same rows of the same tensor: equal addresses alone could be a reused buffer
+        const ggml_tensor * sroot = sx->view_src ? sx->view_src : sx;
+        const ggml_tensor * xroot = x->view_src ? x->view_src : x;
+        if ((bs != bg && bs != 4) || sh_up->src[1] != sx || sroot != xroot || sx->data != x->data ||sx->ne[1] != n_tok || sx->nb[1] != x->nb[2] ||
+                sh_gate->src[0]->ne[0] != k1 || sh_gate->src[0]->ne[1] != n1 || !ggml_are_same_shape(sh_up->src[0], sh_gate->src[0]) ||
+                sh_down->src[0]->ne[0] != n1 || sh_down->src[0]->ne[1] != k1) {
+            return false;
+        }
+    }
+    const int n_shared = sh_gate ? n_tok : 0, pairs = n_shared + n_used * n_tok;
+    for (const ggml_tensor * mm : { up, gate, down }) {
+        ggml_moe_cache_route_table route;
+        if (!ggml_cuda_is_exl3(mm->src[0]->type) || ggml_cuda_exl3_codebook(mm->src[0]->type) != 2 ||
+                !exl3_mul_mat_id_fast_shape(mm) || ggml_mmid_window_n_local(mm) != 0 ||
+                ggml_moe_cache_route_find(mm->src[0]->data, route) ||
+                exl3_int8_resid(ggml_cuda_exl3_bits(mm->src[0]->type), false)) {
+            return false;
+        }
+    }
+    // a few tokens, gate/up with identical layout, down mapping n1 back to k1
+    if (wu->type != wg->type || bg != bd || bg < 2 || bg > 4 || gate->src[1] != x || gate->src[2] != ids || down->src[2] != ids ||
+            !ggml_are_same_shape(wu, wg) || wu->nb[2] != wg->nb[2] || wd->ne[0] != n1 || wd->ne[1] != k1 ||
+            k1 % (128 * exl3_moe_fused::NG1) != 0 || n1 % (128 * exl3_moe_fused::NG2) != 0 ||
+            n_tok > exl3_moe_fused::MAX_TOKENS || x->ne[1] != 1 || x->ne[2] != n_tok || x->ne[3] != 1 ||
+            weights->nb[1] != sizeof(float) || dst->ne[0] != k1 || ggml_nrows(dst) != n_tok || !ggml_is_contiguous(dst) ||
+            size_t(exl3_moe_fused::sync_count(pairs, k1)) > EXL3_INT8_COUNTERS) {
+        return false;
+    }
+
+    const int KW1 = k1 / 128 / exl3_moe_fused::NG1, KW2 = n1 / 128 / exl3_moe_fused::NG2;
+    ggml_cuda_pool_alloc<float> part1(ctx.pool(), size_t(pairs) * 2 * KW1 * n1);
+    ggml_cuda_pool_alloc<float> part2(ctx.pool(), size_t(pairs) * KW2 * k1);
+    ggml_cuda_pool_alloc<uint32_t> xq2(ctx.pool(), size_t(pairs) * n1);
+    ggml_cuda_pool_alloc<float2> xs2(ctx.pool(), size_t(pairs) * (n1 / 128));
+    // items read ids/weights/x until late in the launch, so an aliased dst is written via scratch
+    ggml_cuda_pool_alloc<float> out_tmp(ctx.pool());
+    if (dst_aliases_src) {
+        out_tmp.alloc(size_t(n_tok) * k1);
+    }
+
+    exl3_moe_fused::args a {};
+    const ggml_tensor * mats[2][3] = { { gate, up, down }, { sh_gate, sh_up, sh_down } };
+    for (int s = 0; s < (sh_gate ? 2 : 1); ++s) {
+        for (int m = 0; m < 3; ++m) {
+            // MUL_MAT_ID carries svh/suh in src[3]/src[4], MUL_MAT in src[2]/src[3]
+            const ggml_tensor * mm = mats[s][m];
+            a.m[s][m] = { static_cast<const uint8_t *>(mm->src[0]->data), s ? 0 : mm->src[0]->nb[2],
+                static_cast<const half *>(mm->src[s ? 3 : 4]->data), static_cast<const half *>(mm->src[s ? 2 : 3]->data) };
+        }
+    }
+    a.x = static_cast<const float *>(x->data);           a.x_nb1 = int(x->nb[2] / sizeof(float));
+    a.ids = static_cast<const int32_t *>(ids->data);     a.ids_nb1 = int(ids->nb[1] / sizeof(int32_t));
+    a.w = static_cast<const float *>(weights->data);     a.w_nb1 = int(weights->nb[2] / sizeof(float));
+    a.n_used = n_used;
+    a.n_tok = n_tok;
+    a.pairs = pairs;
+    a.limit = limit;
+    a.out = dst_aliases_src ? out_tmp.get() : static_cast<float *>(dst->data);
+    a.part1 = part1.get(); a.part2 = part2.get(); a.xq2 = xq2.get(); a.xs2 = xs2.get();
+    a.sync = exl3_int8_counters(ctx);
+    a.k1 = k1; a.n1 = n1;
+    switch (bg * 10 + bs) {
+        case 20: exl3_moe_fused_launch<2, 2, 0>(ctx, a); break;
+        case 22: exl3_moe_fused_launch<2, 2, 2>(ctx, a); break;
+        case 24: exl3_moe_fused_launch<2, 2, 4>(ctx, a); break;
+        case 30: exl3_moe_fused_launch<3, 3, 0>(ctx, a); break;
+        case 33: exl3_moe_fused_launch<3, 3, 3>(ctx, a); break;
+        case 34: exl3_moe_fused_launch<3, 3, 4>(ctx, a); break;
+        case 40: exl3_moe_fused_launch<4, 4, 0>(ctx, a); break;
+        case 44: exl3_moe_fused_launch<4, 4, 4>(ctx, a); break;
+        default: GGML_ABORT("unreachable");
+    }
+    if (dst_aliases_src) {
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, a.out, size_t(n_tok) * k1 * sizeof(float), cudaMemcpyDeviceToDevice, ctx.stream()));
+    }
+    return true;
 }
 
 // The cache receives CPU-transformed activations and returns untransformed

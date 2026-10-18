@@ -759,6 +759,13 @@ if ((TARGET ggml-cuda OR TARGET ggml-hip) AND NOT GGML_BACKEND_DL)
         set_tests_properties(test-exl3-residual-policy-${mode} PROPERTIES
             SKIP_RETURN_CODE 77 ENVIRONMENT "GGML_EXL3_INT8=${mode}")
     endforeach()
+    llama_build(test-exl3-glu-fusion.cpp)
+    target_link_libraries(test-exl3-glu-fusion PRIVATE ${EXL3_TEST_BACKEND})
+    foreach(mode -1 1 2)
+        llama_test(test-exl3-glu-fusion NAME test-exl3-glu-fusion-${mode})
+        set_tests_properties(test-exl3-glu-fusion-${mode} PROPERTIES
+            SKIP_RETURN_CODE 77 ENVIRONMENT "GGML_EXL3_INT8=${mode}")
+    endforeach()
 endif()
 if (TARGET ggml-cuda AND NOT GGML_BACKEND_DL)
     enable_language(CUDA)

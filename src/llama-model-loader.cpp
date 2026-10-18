@@ -2381,6 +2381,30 @@ bool llama_model_loader::load_all_data(
         });
     }
 
+    // --numa experts: home each mapped expert's pages before validation, mlock or the load
+    // itself can fault them in, as page placement cannot move pages that are already mapped
+    if (use_mmap && tensor_source == nullptr) {
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        auto * place_fn = cpu_dev ? (decltype(ggml_numa_place_experts) *) ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(cpu_dev), "ggml_backend_cpu_numa_place_experts") : nullptr;
+        const int64_t t0 = ggml_time_us();
+        size_t placed = 0;
+        for (const ggml_tensor * cur : tensors) {
+            const auto * weight = get_weight(ggml_get_name(cur));
+            if (!place_fn || !weight || cur->data != nullptr || !bufs.count(weight->idx) || ggml_n_dims(cur) != 3 ||
+                    (!strstr(ggml_get_name(cur), "_exps") && !strstr(ggml_get_name(cur), "_chexps"))) {
+                continue;
+            }
+            if (place_fn(files.at(weight->idx)->file_id(), weight->offs, cur->nb[1], cur->ne[1], cur->ne[2])) {
+                placed += ggml_nbytes(cur);
+            }
+        }
+        if (placed > 0) {
+            LLAMA_LOG_INFO("%s: NUMA-placed %.2f GiB of experts in %.1f s\n", __func__,
+                    double(placed)/double(GiB), (ggml_time_us() - t0) / 1e6);
+        }
+    }
+
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (tensor_source && cur->data != nullptr) {

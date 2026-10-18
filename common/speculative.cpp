@@ -5554,12 +5554,6 @@ common_params common_base_params_to_speculative(const common_params & params) {
     const auto & params_spec = params.speculative.draft;
     common_params result = params;
 
-    // Keep sidecar catch-up scratch from crowding out the target's expert cache.
-    // Preserve the logical batch: llama_decode micro-batches its hidden rows.
-    if (params.speculative.has_external_mtp_sidecar()) {
-        result.n_ubatch = std::min(result.n_ubatch, 256);
-    }
-
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
 

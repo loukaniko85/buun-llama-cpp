@@ -1005,6 +1005,8 @@ struct llm_graph_params {
         }
 
         return
+            // a warmup graph routes every expert
+            cparams.warmup                  == other.cparams.warmup                  &&
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
@@ -1252,6 +1254,14 @@ struct llm_graph_context {
               ggml_tensor * cur,
               ggml_tensor * d2t,
                   int64_t   n_vocab) const;
+
+    // MTP greedy draft chain tail: write the drafted token, its top-10 confidence and the next
+    // hidden row back to the device stages (tok is the argmax, remapped by the caller if needed)
+    void build_mtp_chain_out(
+              ggml_cgraph * gf,
+              ggml_tensor * logits,
+              ggml_tensor * tok,
+              ggml_tensor * h_next) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(

@@ -195,6 +195,135 @@ k_ar1_allreduce(float4 * __restrict__ dst, char * base, const ar1_bases bases, i
     }
 }
 
+// Decode-sized messages: LL lines. Every 16-byte line carries three floats and a tag derived from the token,
+// written with one system-scope vector store and read with one vector load, so a reader that sees the tag
+// sees the data: no fences or flags on the critical path, one host round trip per peer. A rank never runs
+// more than one reduce ahead of a peer (it cannot finish reduce k before every peer published k, which a peer
+// does only after finishing k - 1), so the GGML_CUDA_AR1_SLOTS slots never collide and no done flags are
+// needed. The tag is a quiet NaN with the token as payload, so stale data of the slot's previous user (an
+// earlier tag, or floats of the flag-based kernel) cannot match.
+static constexpr int AR1_LL_BLOCKS    = 8;
+static constexpr int AR1_LL_THREADS   = 192;
+static constexpr int AR1_LL_MAX_RANKS = 8;
+static_assert(AR1_MB_BLOCKS % AR1_LL_BLOCKS == 0, "the LL kernel advances the launch counter by AR1_MB_BLOCKS");
+
+static __device__ __forceinline__ void ar1_st_line(float4 * p, float4 v) {
+    asm volatile("st.relaxed.sys.global.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(p), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w) : "memory");
+}
+static __device__ __forceinline__ float4 ar1_ld_line(const float4 * p) {
+    float4 v;
+    asm volatile("ld.relaxed.sys.global.v4.f32 {%0, %1, %2, %3}, [%4];" : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "l"(p) : "memory");
+    return v;
+}
+
+// Weights the next subgraph reads first, prefetched into L2 by the LL kernel while it waits for its peers: in
+// decode those small weights were evicted by the layer's large matmuls and would otherwise be read from DRAM by
+// a latency-bound kernel right after the reduce.
+static constexpr int AR1_PF_MAX   = 4;
+static constexpr int AR1_PF_NODES = 8;
+struct ar1_prefetch {
+    const char * p[AR1_PF_MAX];
+    int64_t      bytes[AR1_PF_MAX];
+};
+
+// the device weights read by the first AR1_PF_NODES nodes of `next`, up to the first one that exceeds `budget`
+// (a larger weight streams through L2 and would evict the rest before use)
+static ar1_prefetch ar1_prefetch_plan(const ggml_cgraph * next, size_t budget) {
+    ar1_prefetch pf = {};
+    if (next == nullptr) {
+        return pf;
+    }
+    int n = 0;
+    for (int i = 0; i < next->n_nodes && i < AR1_PF_NODES && n < AR1_PF_MAX; i++) {
+        for (int s = 0; s < GGML_MAX_SRC && n < AR1_PF_MAX; s++) {
+            const ggml_tensor * w = next->nodes[i]->src[s];
+            if (w == nullptr || w->buffer == nullptr || ggml_backend_buffer_is_host(w->buffer) ||
+                    ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                    std::find(pf.p, pf.p + n, (const char *) w->data) != pf.p + n) {
+                continue;
+            }
+            const size_t bytes = ggml_nbytes(w);
+            if (bytes > budget) {
+                return pf;
+            }
+            budget -= bytes;
+            pf.p[n]     = (const char *) w->data;
+            pf.bytes[n] = (int64_t) bytes;
+            n++;
+        }
+    }
+    return pf;
+}
+
+// grid-strided over lines: a thread owns the floats of its lines, so it publishes, reduces and overwrites them
+// without any barrier
+static __global__ void __launch_bounds__(AR1_LL_THREADS)
+k_ar1_ll(float * __restrict__ dst, int * state, const ar1_bases bases, const size_t max_bytes,
+        const int n_ranks, const int rank, const int n, const int active, const ar1_prefetch pf) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+    __shared__ int s_token;
+    if (threadIdx.x == 0) {
+        s_token = atomicAdd(&state[0], AR1_MB_BLOCKS / AR1_LL_BLOCKS) / AR1_MB_BLOCKS + 1;
+    }
+    __syncthreads();
+    const int token = s_token;
+    const int slot  = token % GGML_CUDA_AR1_SLOTS;
+    // the flag-based kernel must not wait for done flags of this launch, which never come
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        state[6 + slot] = 0;
+    }
+    const float tag = __int_as_float(0x7FC00000 | (token & 0x3FFFFF));
+    const int   nl  = (n + 2) / 3;
+    const int   t0  = blockIdx.x * blockDim.x + threadIdx.x;
+    const int   nt  = gridDim.x * blockDim.x;
+
+    float4 * mine = ar1_slice(bases, max_bytes, slot, rank);
+    for (int l = t0; l < nl; l += nt) {
+        float v[3];
+        for (int k = 0; k < 3; k++) {
+            v[k] = active && 3 * l + k < n ? dst[3 * l + k] : 0.0f;
+        }
+        ar1_st_line(mine + l, make_float4(v[0], v[1], v[2], tag));
+    }
+    // after publishing, so the prefetches do not delay the peers
+#pragma unroll
+    for (int j = 0; j < AR1_PF_MAX; j++) {
+        ggml_cuda_prefetch_l2(pf.p[j], pf.bytes[j]);
+    }
+    for (int l = t0; l < nl; l += nt) {
+        float4 o[AR1_LL_MAX_RANKS];
+#pragma unroll
+        for (int r = 0; r < AR1_LL_MAX_RANKS; r++) {
+            if (r < n_ranks && r != rank) {
+                o[r] = ar1_ld_line(ar1_slice(bases, max_bytes, slot, r) + l);
+            }
+        }
+        // sum in rank order from zero, like the flag-based kernel, so every rank gets bit-identical results
+        float acc[3] = { 0.0f, 0.0f, 0.0f };
+#pragma unroll
+        for (int r = 0; r < AR1_LL_MAX_RANKS; r++) {
+            if (r == rank) {
+                for (int k = 0; k < 3; k++) {
+                    acc[k] += active && 3 * l + k < n ? dst[3 * l + k] : 0.0f;
+                }
+            } else if (r < n_ranks) {
+                while (__float_as_int(o[r].w) != __float_as_int(tag)) {
+                    __nanosleep(20);
+                    o[r] = ar1_ld_line(ar1_slice(bases, max_bytes, slot, r) + l);
+                }
+                acc[0] += o[r].x; acc[1] += o[r].y; acc[2] += o[r].z;
+            }
+        }
+        for (int k = 0; k < 3 && 3 * l + k < n; k++) {
+            dst[3 * l + k] = acc[k];
+        }
+    }
+#else
+    GGML_UNUSED_VARS(dst, state, bases, max_bytes, n_ranks, rank, n, active, pf);
+    NO_DEVICE_CODE;
+#endif
+}
+
 // Multi-megabyte messages (prompt processing). GPU-initiated stores to mapped host memory run at ~3 GB/s
 // while kernel loads reach ~18 GB/s and a copy-engine memcpy runs at PCIe rate, so the slice is published
 // with a D2H memcpy issued by the host between two kernels (stream-ordered, capturable):
@@ -596,7 +725,8 @@ bool ggml_cuda_ar_oneshot_eligible(const ggml_cuda_ar_oneshot * st, ggml_tensor 
 
 // Every rank's launches go to that rank's own stream and the mode decisions depend only on the message, so
 // the ranks can be enqueued independently (one issuer thread per device); the kernels synchronize on-device.
-bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend_t backend, ggml_tensor ** tensors, int rank) {
+bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend_t backend, ggml_tensor ** tensors, int rank,
+        const ggml_cgraph * next) {
     const int n4 = (int) (ggml_nbytes(tensors[0]) / 16);
     // reduce-scatter mode from this message size on (GGML_CUDA_AR1_SCATTER=<bytes>, 0 = never)
     static const size_t scatter_from = getenv("GGML_CUDA_AR1_SCATTER") != nullptr ? (size_t) atoll(getenv("GGML_CUDA_AR1_SCATTER")) : (size_t) 32 * 1024;
@@ -606,6 +736,11 @@ bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend
     // multi-block one advances by its block count, so the two must not interleave: the host serializes them)
     static const size_t mb_from = getenv("GGML_CUDA_AR1_MB_FROM") != nullptr ? (size_t) atoll(getenv("GGML_CUDA_AR1_MB_FROM")) : (size_t) 256 * 1024;
     const int multi_block = ggml_nbytes(tensors[0]) > mb_from && n4 >= st->n_ranks * AR1_MB_BLOCKS;
+    // LL lines up to this message size (GGML_CUDA_AR1_LL=<bytes>, 0 = never); a slot holds 16 bytes per 3 floats
+    static const size_t ll_max = getenv("GGML_CUDA_AR1_LL") != nullptr ? (size_t) atoll(getenv("GGML_CUDA_AR1_LL")) : (size_t) 64 * 1024;
+    const int n  = n4 * 4;
+    const int ll = !multi_block && ggml_nbytes(tensors[0]) <= ll_max && (size_t) (n + 2) / 3 * 16 <= st->max_bytes &&
+                   st->n_ranks <= AR1_LL_MAX_RANKS;
     {
         const int i = rank;
         auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
@@ -645,6 +780,12 @@ bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend
                     (float4 *) tensors[i]->data, st->dev_base[i], bases, st->dev_state[i],
                     st->data_bytes, st->max_bytes, st->n_ranks, i, n4);
             }
+        } else if (ll) {
+            // half of L2 for the prefetch (GGML_CUDA_AR1_PREFETCH=0 disables it)
+            static const bool prefetch = getenv("GGML_CUDA_AR1_PREFETCH") == nullptr || atoi(getenv("GGML_CUDA_AR1_PREFETCH")) != 0;
+            k_ar1_ll<<<AR1_LL_BLOCKS, AR1_LL_THREADS, 0, stream>>>(
+                (float *) tensors[i]->data, st->dev_state[i], bases, st->max_bytes, st->n_ranks, i, n, active,
+                ar1_prefetch_plan(prefetch ? next : nullptr, ggml_cuda_info().devices[st->devices[i]].l2_size / 2));
         } else {
             k_ar1_allreduce<<<1, AR1_THREADS, 0, stream>>>(
                 (float4 *) tensors[i]->data, st->dev_base[i], bases, st->dev_state[i],
@@ -657,7 +798,7 @@ bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot * st, ggml_backend
 
 bool ggml_cuda_ar_oneshot_allreduce(ggml_cuda_ar_oneshot * st, ggml_backend_t * backends, ggml_tensor ** tensors) {
     for (int i = 0; i < st->n_ranks; i++) {
-        ggml_cuda_ar_oneshot_allreduce_rank(st, backends[i], tensors, i);
+        ggml_cuda_ar_oneshot_allreduce_rank(st, backends[i], tensors, i, nullptr);
     }
     return true;
 }
@@ -670,6 +811,6 @@ ggml_cuda_ar_oneshot * ggml_cuda_ar_oneshot_init(const int *, size_t, size_t) { 
 void ggml_cuda_ar_oneshot_free(ggml_cuda_ar_oneshot *) {}
 bool ggml_cuda_ar_oneshot_eligible(const ggml_cuda_ar_oneshot *, ggml_tensor **) { return false; }
 bool ggml_cuda_ar_oneshot_allreduce(ggml_cuda_ar_oneshot *, ggml_backend_t *, ggml_tensor **) { return false; }
-bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot *, ggml_backend_t, ggml_tensor **, int) { return false; }
+bool ggml_cuda_ar_oneshot_allreduce_rank(ggml_cuda_ar_oneshot *, ggml_backend_t, ggml_tensor **, int, const ggml_cgraph *) { return false; }
 
 #endif

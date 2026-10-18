@@ -583,6 +583,7 @@ struct common_moe_cache_params {
     int cpu_overlap            = -2; // -2 = inherit provider, -1 = auto, 0..8 = CPU rows
     bool mode_explicit         = false;
     bool fit_selected          = false;
+    bool no_repack             = false; // deprecated "on": auto with canonical expert weights
     bool profile               = true;
     std::string profile_path;
 };
@@ -592,6 +593,8 @@ struct common_params {
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+    bool    n_ubatch_auto         =  true; // let the fit raise n_ubatch when weights stream to the GPU per ubatch
+    bool    n_batch_explicit      = false; // -b was passed: the auto ubatch never exceeds it
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode

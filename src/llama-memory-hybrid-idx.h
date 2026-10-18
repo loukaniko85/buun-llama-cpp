@@ -130,6 +130,7 @@ private:
     std::unique_ptr<kpool_layout> kpool_lay;
     void mem_idx_stale_set(llama_seq_id seq_id, llama_pos p0);
     llama_pos mem_idx_stale_pos(llama_seq_id seq_id, llama_pos p0) const;
+    void mem_idx_stale_copy(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, bool dst_empty);
     bool kpool_can_remove(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     stale_pos_t mem_idx_stale = stale_pos_clean();
 };
@@ -191,6 +192,7 @@ public:
 
     uint32_t get_n_kpool() const;
     uint32_t get_n_kpool_new() const;
+    bool get_kpool_partial_share() const; // whether pools of different sequences overlap, see kpool_state
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                         ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
@@ -227,6 +229,11 @@ private:
 
     // The ubatch kpool_st was built for, guards against reads before apply.
     size_t i_kpool = SIZE_MAX;
+
+    // tokens of the ubatches after the first, 0 unless the attention cache keeps the batch's shapes stable
+    uint32_t n_tokens_rest = 0;
+    // pool count the first ubatch bounds the whole batch to
+    uint32_t n_pool_batch  = 0;
 
     // Whether this context tracks k-pool states.
     bool kpool_track() const;

@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 
 #include "ggml.h"
+#include "ggml-moe-store.h"
 
 #include <cstring>
 #include <climits>
@@ -592,6 +593,7 @@ struct llama_mmap::impl {
         }
 
         mapped_fragments.emplace_back(0, file->size());
+        ggml_moe_store_map(addr, file->size(), fd);
     }
 
     static void align_range(size_t * first, size_t * last, size_t page_size) {
@@ -621,6 +623,7 @@ struct llama_mmap::impl {
 
         void * next_page_start = (uint8_t *) addr + first;
 
+        ggml_moe_store_unmap(next_page_start, len);
         if (munmap(next_page_start, len)) {
             LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
         }
@@ -644,6 +647,7 @@ struct llama_mmap::impl {
 
     ~impl() {
         for (const auto & frag : mapped_fragments) {
+            ggml_moe_store_unmap((char *) addr + frag.first, frag.second - frag.first);
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
             }

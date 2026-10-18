@@ -201,6 +201,8 @@ add_library(ggml-base
             ggml-alloc.c
             ggml-backend.cpp
             ggml-backend-meta.cpp
+            ggml-moe-store.cpp
+            ../include/ggml-moe-store.h
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h

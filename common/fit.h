@@ -119,7 +119,8 @@ common_params_fit_status common_fit_params(
                              size_t * margins,               // margins of memory to leave per device in bytes
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
-                     ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
+                     ggml_log_level   log_level,             // minimum log level to print during fitting, lower levels go to debug log
+                           uint32_t   n_ubatch_max = 0);     // > n_ubatch: raise n_ubatch up to this when weights stream per ubatch
 
 // print estimated memory to stdout
 void common_fit_print(

@@ -17,6 +17,9 @@ struct llama_cparams {
     uint32_t n_ubatch;
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
+    int32_t  layer_begin;     // trunk layers [layer_begin, layer_end) of a split context
+    int32_t  layer_end;
+    struct ggml_tensor * layer_hop = nullptr; // residual stream rows exchanged by the split halves
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
@@ -26,6 +29,7 @@ struct llama_cparams {
 
     enum llama_moe_cache_mode moe_cache_mode;
     size_t moe_cache_budget_mib;
+    int32_t moe_cache_max_devices;
     int32_t moe_cache_expert_parallel;
     int32_t moe_cache_cpu_overlap;
     std::string moe_cache_profile_path;

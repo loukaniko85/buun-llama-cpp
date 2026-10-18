@@ -343,6 +343,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-vbr.h
     include/ggml-opt.h
     include/ggml-metal.h
+    include/ggml-moe-store.h
     include/ggml-rpc.h
     include/ggml-virtgpu.h
     include/ggml-sycl.h

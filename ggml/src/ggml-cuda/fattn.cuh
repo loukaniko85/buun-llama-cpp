@@ -15,3 +15,6 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 // Release one backend context's persistent Q/K/V attention scratch. The backend destructor drains
 // its streams before calling this, so VMM mappings and cudaMalloc buffers are no longer in flight.
 void ggml_cuda_fattn_scratch_free(ggml_backend_cuda_context & ctx);
+
+// Grow the lazily allocated Q-rotation scratch to fit every turbo-K attention node of cgraph.
+void ggml_cuda_fattn_scratch_reserve(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph);

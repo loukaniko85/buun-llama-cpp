@@ -1255,64 +1255,59 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
 
     const uint32_t n_recur = hparams.n_layer();
 
-    ggml_backend_dev_t copy_dev = nullptr;
-    bool compatible = true;
-    size_t n_tensors = 0;
-    auto inspect = [&](ggml_tensor * t) {
-        if (!t || !compatible) {
-            return;
+    // one copy graph per device, built on first use of the cell pair; not cached when any tensor is off-device
+    const auto key = std::make_pair(i_src, i_dst);
+    auto cached = copy_graph_cache_.find(key);
+    if (cached == copy_graph_cache_.end()) {
+        std::map<ggml_backend_dev_t, std::vector<ggml_tensor *>> by_dev;
+        bool compatible = true;
+        auto inspect = [&](ggml_tensor * t) {
+            if (!t || !compatible) {
+                return;
+            }
+            if (!t->buffer || ggml_backend_buffer_is_host(t->buffer) ||
+                ggml_backend_buffer_is_meta(t->buffer)) {
+                compatible = false;
+                return;
+            }
+            auto * buft = ggml_backend_buffer_get_type(t->buffer);
+            auto * dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+            if (!dev) {
+                compatible = false;
+                return;
+            }
+            by_dev[dev].push_back(t);
+        };
+        for (uint32_t il = 0; il < n_recur; ++il) {
+            inspect(r_l[il]);
+            inspect(s_l[il]);
+            inspect(p_l[il]);
         }
-        if (!t->buffer || ggml_backend_buffer_is_host(t->buffer) ||
-            ggml_backend_buffer_is_meta(t->buffer)) {
-            compatible = false;
-            return;
-        }
-        auto * buft = ggml_backend_buffer_get_type(t->buffer);
-        auto * dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
-        if (!dev || (copy_dev && copy_dev != dev)) {
-            compatible = false;
-            return;
-        }
-        copy_dev = dev;
-        ++n_tensors;
-    };
-    for (uint32_t il = 0; il < n_recur; ++il) {
-        inspect(r_l[il]);
-        inspect(s_l[il]);
-        inspect(p_l[il]);
-    }
 
-    if (compatible && copy_dev && n_tensors > 0) {
-        auto backend_it = copy_backends_.find(copy_dev);
-        if (backend_it == copy_backends_.end()) {
-            backend_it = copy_backends_.emplace(
-                copy_dev, ggml_backend_ptr(ggml_backend_dev_init(copy_dev, nullptr))).first;
-        }
-        ggml_backend_t backend = backend_it->second.get();
-        if (backend) {
-            const auto key = std::make_tuple(copy_dev, i_src, i_dst);
-            auto cached = copy_graph_cache_.find(key);
-            if (cached != copy_graph_cache_.end()) {
-                const ggml_status status = ggml_backend_graph_compute_async(
-                    cached->second.backend, cached->second.graph);
-                ggml_backend_synchronize(cached->second.backend);
-                if (status == GGML_STATUS_SUCCESS) {
-                    return;
-                }
-                copy_graph_cache_.erase(cached);
+        std::vector<copy_graph_entry> entries;
+        for (const auto & [dev, tensors] : by_dev) {
+            if (!compatible) {
+                break;
+            }
+            auto backend_it = copy_backends_.find(dev);
+            if (backend_it == copy_backends_.end()) {
+                backend_it = copy_backends_.emplace(
+                    dev, ggml_backend_ptr(ggml_backend_dev_init(dev, nullptr))).first;
+            }
+            ggml_backend_t backend = backend_it->second.get();
+            if (!backend) {
+                compatible = false;
+                break;
             }
 
-            const size_t graph_size = n_tensors * 5 + 8;
-            const size_t ctx_mem = 3 * n_tensors * ggml_tensor_overhead() +
+            const size_t graph_size = tensors.size() * 5 + 8;
+            const size_t ctx_mem = 3 * tensors.size() * ggml_tensor_overhead() +
                 ggml_graph_overhead_custom(graph_size, false);
             ggml_init_params batch_params = {ctx_mem, nullptr, true};
             ggml_context * ctx = ggml_init(batch_params);
             ggml_cgraph * graph = ggml_new_graph_custom(ctx, graph_size, false);
 
-            auto add_copy = [&](ggml_tensor * t) {
-                if (!t) {
-                    return;
-                }
+            for (ggml_tensor * t : tensors) {
                 ggml_tensor * src_v = ggml_view_1d(
                     ctx, t, t->ne[0], (size_t) i_src * t->nb[1]);
                 ggml_tensor * dst_v = ggml_view_1d(
@@ -1320,25 +1315,31 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
                 src_v->buffer = t->buffer;
                 dst_v->buffer = t->buffer;
                 ggml_build_forward_expand(graph, ggml_cpy(ctx, src_v, dst_v));
-            };
-            for (uint32_t il = 0; il < n_recur; ++il) {
-                add_copy(r_l[il]);
-                add_copy(s_l[il]);
-                add_copy(p_l[il]);
             }
 
-            const ggml_status status =
-                ggml_backend_graph_compute_async(backend, graph);
-            if (status == GGML_STATUS_SUCCESS) {
-                ggml_backend_synchronize(backend);
-                copy_graph_cache_.emplace(key, copy_graph_entry {
-                    ggml_context_ptr(ctx), graph, backend,
-                });
-                return;
-            }
-            ggml_backend_synchronize(backend);
-            ggml_free(ctx);
+            entries.push_back({ ggml_context_ptr(ctx), graph, backend });
         }
+        if (compatible && !entries.empty()) {
+            cached = copy_graph_cache_.emplace(key, std::move(entries)).first;
+        }
+    }
+
+    if (cached != copy_graph_cache_.end()) {
+        // all devices are launched before any is awaited
+        size_t n_launched = 0;
+        for (const auto & entry : cached->second) {
+            if (ggml_backend_graph_compute_async(entry.backend, entry.graph) != GGML_STATUS_SUCCESS) {
+                break;
+            }
+            ++n_launched;
+        }
+        for (size_t i = 0; i < n_launched; ++i) {
+            ggml_backend_synchronize(cached->second[i].backend);
+        }
+        if (n_launched == cached->second.size()) {
+            return;
+        }
+        copy_graph_cache_.erase(cached);
     }
 
     // create one shared ggml context for all fallback view pairs (meta caches

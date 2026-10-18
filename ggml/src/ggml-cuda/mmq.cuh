@@ -1039,9 +1039,14 @@ static __global__ void build_sparse_tile_prefix(
     *work_counter = 0;
 }
 
+// Types whose SM86 sparse MUL_MAT_ID prefill measured faster with 32/64-wide tiles.
+static constexpr __host__ __device__ bool mmq_sm86_narrow_sparse(ggml_type type) {
+    return type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS;
+}
+
 static constexpr __device__ int mmq_sparse_occupancy(ggml_type type, int J, bool fallback) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
-    if (type == GGML_TYPE_Q2_0 && J == 64 && !fallback) {
+    if ((type == GGML_TYPE_Q2_0 || mmq_sm86_narrow_sparse(type)) && J <= 64 && !fallback) {
         // Two blocks fit when this sparse specialization stays within128 registers.
         return 2;
     }
@@ -1620,15 +1625,17 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     // sparse MUL_MAT_ID this creates more imbalance than it removes on the measured SM86 and
     // SM120 configurations, so launch independent output tiles instead. Keep each architecture's
     // measured type, tile, and batch policy separate.
+    // The SM86 narrow tiles are capped in mul_mat_q_switch_J.
+    constexpr bool narrow_sparse = mmq_sm86_narrow_sparse(type);
     constexpr bool has_sparse_tiled_kernel =
         !fallback &&
-        (J == 64 || J == 128) &&
+        (J == 64 || J == 128 || (J == 32 && narrow_sparse)) &&
         (type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ2_XS ||
-         type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_MXFP4);
-    const bool use_sparse_sm86 = cc == 860 && (J == 128 || (type == GGML_TYPE_Q2_0 && J == 64 &&
+         type == GGML_TYPE_IQ2_S || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_MXFP4);
+    const bool use_sparse_sm86 = cc == 860 && (J == 128 || (narrow_sparse && J <= 64) || (type == GGML_TYPE_Q2_0 && J == 64 &&
         args.ncols_max >= 1024 && ggml_cuda_highest_compiled_arch(cc) == 860)) &&
-        (type == GGML_TYPE_Q2_0 || type == GGML_TYPE_IQ2_XXS || type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_MXFP4);
-    const bool use_sparse_sm120 = cc == GGML_CUDA_CC_BLACKWELL && type != GGML_TYPE_Q2_0 &&
+        (type == GGML_TYPE_Q2_0 || narrow_sparse || type == GGML_TYPE_MXFP4);
+    const bool use_sparse_sm120 = cc == GGML_CUDA_CC_BLACKWELL && type != GGML_TYPE_Q2_0 && type != GGML_TYPE_IQ2_S &&
         args.ncols_max >= (type == GGML_TYPE_IQ2_XS ? 2048 : 128);
     const bool use_sparse_tiled_kernel = has_sparse_tiled_kernel && args.expert_bounds &&
         args.nsamples_y == 1 && (use_sparse_sm86 || use_sparse_sm120) &&
@@ -1637,8 +1644,9 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         type != GGML_TYPE_MXFP4;
     // MXFP4's independent tiled launch remains faster across the measured prompt
     // range; its compact persistent queue loses at 1024/2048 and is neutral deeper.
+    // SM86 narrow types already win with the queue at 512 tokens, not yet at 256.
     const bool use_sparse_persistent_kernel = has_sparse_persistent_kernel &&
-        use_sparse_tiled_kernel && args.ncols_max >= 1024;
+        use_sparse_tiled_kernel && args.ncols_max >= (cc == 860 && narrow_sparse ? 512 : 1024);
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
     const int ntzw = args.nchannels_y * args.nsamples_y;
@@ -1668,7 +1676,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                     const uint3 nty_fd = init_fastdiv_values(nty);
                     build_sparse_tile_prefix<J><<<1, 1, 0, stream>>>(
                         args.expert_bounds, tile_prefix.get(), work_counter.get(), args.nchannels_y, nty);
-                    const int sparse_blocks = nsm * (cc == 860 && type == GGML_TYPE_Q2_0 && J == 64 ? 2 : 1);
+                    // SM86 J <= 64 (Q2_0 and narrow types) measured fastest with two blocks per SM.
+                    const int sparse_blocks = nsm * (cc == 860 && J <= 64 ? 2 : 1);
                     mul_mat_q_sparse_persistent<type, J, fallback><<<sparse_blocks, block_dims, nbytes_shared + persistent_header, stream>>>
                         (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tile_prefix.get(), work_counter.get(), args.y_scale,
                          blocks_per_ne00_fd, args.nrows_x, args.stride_row_x, args.ncols_y, args.nrows_dst,
@@ -1760,6 +1769,16 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
         type == GGML_TYPE_Q2_0 && !fallback && args.expert_bounds &&
         args.nsamples_y == 1 && args.ncols_max >= 1024) {
         J_cap = 64;
+    }
+    // SM86 sparse prefill (measured at 512+ tokens): each expert sees only
+    // ncols_y/nchannels_x tokens, so a 32- or 64-wide tile pads far less than 128.
+    if (cc == 860 && mmq_sm86_narrow_sparse(type) && !fallback &&
+        args.expert_bounds && args.nsamples_y == 1 && args.ncols_max >= 512) {
+        const int64_t ncols_expert = (args.ncols_y + args.nchannels_x - 1) / args.nchannels_x;
+        if (ncols_expert <= 64) {
+            // IQ2_S measured faster with the 32-wide tile up to 64 tokens per expert
+            J_cap = (ncols_expert <= 32 || type == GGML_TYPE_IQ2_S) ? 32 : 64;
+        }
     }
     // Ada MMQ tile cap re-port (was get_mmq_x_max_host_for_type<type>, commits ab5a019bc +
     // 239296c43, dropped by upstream #24127's config-table rewrite): on Ada Lovelace, cap the

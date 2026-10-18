@@ -247,6 +247,7 @@ llama_context::llama_context(
     cparams.n_threads_batch         = params.n_threads_batch;
     cparams.moe_cache_mode          = params.moe_cache_mode;
     cparams.moe_cache_budget_mib    = params.moe_cache_budget_mib;
+    cparams.moe_cache_max_devices   = 0;
     cparams.moe_cache_expert_parallel = params.moe_cache_expert_parallel;
     cparams.moe_cache_cpu_overlap = params.moe_cache_cpu_overlap;
     cparams.moe_cache_profile_path = params.moe_cache_profile_path
@@ -267,6 +268,35 @@ llama_context::llama_context(
     embd_layer_inp.resize(hparams.n_layer() + 1);
 
     cparams.ctx_type          = params.ctx_type;
+    // An MTP context only routes the NextN layers' experts. Capping its expert cache at their
+    // size, plus scratch, on one device leaves the rest of the memory to the target context's
+    // cache instead of an even split between the two. A provider budget (environment) still
+    // wins, and the cap never drops below the automatic slab floor, which would leave the
+    // cache dormant.
+    ggml_moe_cache_config moe_cache_provider = {};
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && cparams.moe_cache_budget_mib == 0 &&
+        cparams.moe_cache_mode != LLAMA_MOE_CACHE_MODE_OFF && ggml_moe_cache.query_config &&
+        ggml_moe_cache.query_config(cparams.moe_cache_mode == LLAMA_MOE_CACHE_MODE_UNSPECIFIED
+                ? -1 : cparams.moe_cache_mode == LLAMA_MOE_CACHE_MODE_AUTO,
+            0, &moe_cache_provider) &&
+        moe_cache_provider.budget_bytes == 0) {
+        std::vector<llama_moe_tensor_info> moe_info(llama_model_get_moe_tensor_info(&model, nullptr, 0));
+        llama_model_get_moe_tensor_info(&model, moe_info.data(), moe_info.size());
+
+        size_t nextn_expert_bytes = 0;
+        for (const auto & t : moe_info) {
+            if (t.layer >= (int64_t) hparams.n_layer()) {
+                nextn_expert_bytes += t.expert_size * (size_t) t.n_expert;
+            }
+        }
+        if (nextn_expert_bytes > 0) {
+            // headroom for the cache's own per-device scratch
+            constexpr size_t mtp_moe_cache_scratch_mib = 256;
+            cparams.moe_cache_budget_mib = (std::max(nextn_expert_bytes, moe_cache_provider.minimum_slab_bytes) >> 20) +
+                mtp_moe_cache_scratch_mib;
+            cparams.moe_cache_max_devices = 1;
+        }
+    }
     cparams.rope_scaling_type = params.rope_scaling_type;
     cparams.pooling_type      = params.pooling_type;
 
@@ -412,6 +442,41 @@ llama_context::llama_context(
     if ((llama_model_has_encoder(&model) && model.arch != LLM_ARCH_DFLASH) ||
         model.arch == LLM_ARCH_DFLASH_DRAFT || model.arch == LLM_ARCH_GEMMA4_DFLASH_DRAFT) {
         cparams.n_ubatch = cparams.n_batch;
+    }
+
+    // An MTP context runs one block over the target's hidden rows: a target-sized ubatch only grows
+    // its compute buffer, crowding out the target's expert cache. n_batch stays, decode micro-batches.
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        cparams.n_ubatch = std::min(cparams.n_ubatch, 256u);
+    }
+
+    cparams.layer_begin = params.layer_begin;
+    cparams.layer_end   = params.layer_end == 0 ? (int32_t) hparams.n_layer() : params.layer_end;
+    if (cparams.layer_begin != 0 || cparams.layer_end != (int32_t) hparams.n_layer()) {
+        if (model.arch != LLM_ARCH_GLM5_NEXT || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+            throw std::runtime_error("layer-split contexts are only supported for the GLM5-Next trunk");
+        }
+        if (cparams.layer_end < (int32_t) hparams.n_layer() && params.embeddings) {
+            throw std::runtime_error("a layer-split head has no outputs, embeddings are not supported");
+        }
+        // one hop per context: a head [0, s) or a tail [s, n_layer)
+        if (cparams.layer_begin < 0 || cparams.layer_begin >= cparams.layer_end || cparams.layer_end > (int32_t) hparams.n_layer() ||
+                (cparams.layer_begin > 0 && cparams.layer_end < (int32_t) hparams.n_layer())) {
+            throw std::runtime_error("invalid layer range");
+        }
+        // shared-indexer layers reuse the selection of the previous full one, which must be ours
+        for (int il = cparams.layer_begin; il < cparams.layer_end; ++il) {
+            if (!hparams.is_recr(il)) {
+                if (!hparams.is_indexer_full(il)) {
+                    throw std::runtime_error(format("layer split at %d: first attention layer %d has a shared indexer", cparams.layer_begin, il));
+                }
+                break;
+            }
+        }
+        // the hop is indexed by position modulo its rows: the head may run a whole batch plus one
+        // ubatch ahead of the tail
+        const int il_hop = cparams.layer_begin > 0 ? cparams.layer_begin : cparams.layer_end;
+        cparams.layer_hop = model.get_layer_hop(il_hop, (int64_t) cparams.n_batch + cparams.n_ubatch);
     }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
@@ -874,7 +939,10 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             // but is still wrong for cases like --no-kv-offload.
             ggml_backend_dev_t device_layer = model.dev_layer(node.il);
 
-            if (device_fused != device_layer) {
+            // the scheduler only places a node where it is supported, so missing support shows as a
+            // fall back to the CPU; a CPU layer's node offloaded to a GPU (large batches) is supported
+            if (device_fused != device_layer &&
+                    (!device_fused || ggml_backend_dev_type(device_fused) == GGML_BACKEND_DEVICE_TYPE_CPU)) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
                         "is assigned to device %s (usually due to missing support)\n",
                         func, node.il,
@@ -1136,7 +1204,7 @@ void llama_context::sched_reserve() {
     switch (cparams.moe_cache_mode) {
         case LLAMA_MOE_CACHE_MODE_OFF:  moe_cache_requested = "off";  break;
         case LLAMA_MOE_CACHE_MODE_AUTO: moe_cache_requested = "auto"; break;
-        case LLAMA_MOE_CACHE_MODE_ON:   moe_cache_requested = "on";   break;
+        case LLAMA_MOE_CACHE_MODE_ON:   moe_cache_requested = "budget"; break;
         case LLAMA_MOE_CACHE_MODE_UNSPECIFIED: break;
     }
     LLAMA_LOG_INFO("%s: MoE cache requested=%s resolved=%s\n",
@@ -1169,10 +1237,12 @@ void llama_context::sched_reserve() {
     ggml_backend_sched_set_moe_cache(
             sched.get(), moe_cache_mode,
             cparams.moe_cache_budget_mib,
+            cparams.moe_cache_max_devices,
             moe_cache_expert_parallel,
             cparams.moe_cache_cpu_overlap,
             cparams.moe_cache_profile_path.empty() ? nullptr :
                 cparams.moe_cache_profile_path.c_str());
+    ggml_backend_sched_set_moe_cache_warmup(sched.get(), cparams.warmup);
 
     // avoid reserving graphs with zero outputs - assume one output per sequence
     const int n_outputs = n_seqs;
@@ -1240,10 +1310,12 @@ void llama_context::sched_reserve() {
                 ggml_backend_sched_set_moe_cache(
                         sched.get(), moe_cache_mode,
                         cparams.moe_cache_budget_mib,
+                        cparams.moe_cache_max_devices,
                         moe_cache_expert_parallel,
                         cparams.moe_cache_cpu_overlap,
                         cparams.moe_cache_profile_path.empty() ? nullptr :
                             cparams.moe_cache_profile_path.c_str());
+                ggml_backend_sched_set_moe_cache_warmup(sched.get(), cparams.warmup);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -4126,9 +4198,7 @@ bool llama_context::set_mtp_draft_chain(bool enable) {
     }
     if (enable && !mtp_chain_tok) {
         const auto & hparams = model.hparams;
-        // only the qwen4exp MTP graph reads and writes the chain stages
-        if (model.arch != LLM_ARCH_QWEN4EXP || model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ||
-                hparams.n_layer_nextn != 1) {
+        if (!model.supports_mtp_draft_chain()) {
             return false;
         }
         // the stages live with the MTP block so its graph reads and writes them in place
@@ -4266,6 +4336,9 @@ void llama_context::set_warmup(bool value) {
     }
 
     cparams.warmup = value;
+    if (sched) {
+        ggml_backend_sched_set_moe_cache_warmup(sched.get(), value);
+    }
 
     // warmups are usually with small batches, so no need to reserve
     //sched_need_reserve = true;
@@ -4456,13 +4529,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (!graph_reuse_disable && slot_alloc && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
-        }
-
+        // no sync needed with pipeline parallelism: the scheduler copies user inputs synchronously
+        // when it queues each split, so a still-running previous graph no longer reads them
         n_reused++;
     } else {
         gf_res_prev_alloc[slot] = false;
@@ -7667,6 +7735,8 @@ llama_context_params llama_context_default_params() {
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
         /*.n_rs_seq                    =*/ 0,
+        /*.layer_begin                 =*/ 0,
+        /*.layer_end                   =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default

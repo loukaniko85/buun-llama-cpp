@@ -1484,7 +1484,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra_dft : nullptr,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
+            !params.n_ubatch_auto ? 0 : params.n_batch_explicit ? params.n_batch : UINT32_MAX);
         if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             COM_ERR("%s", "fit could not prove a viable placement; restoring the pre-fit parameters\n");
             mparams = mparams_before;
@@ -1506,6 +1507,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             // mparams, and callers (e.g. the cache-plan calibration profile) must key on the
             // effective value, never the unresolved -1 sentinel
             params.n_gpu_layers = mparams.n_gpu_layers;
+            params.n_ubatch     = cparams.n_ubatch;
+            params.n_batch      = cparams.n_batch;
             if (common_params_apply_vbr_cpu_fallback(params, true) ==
                     common_vbr_cpu_fallback_result::applied) {
                 COM_WRN("%s", "implicit VBR auto-fit resolved to CPU KV placement; using static f16 KV cache\n");
@@ -1520,7 +1523,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.moe_cache.mode_explicit || params.moe_cache.fit_selected) {
         const char * mode = params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF ? "off" :
             params.moe_cache.mode == COMMON_MOE_CACHE_MODE_AUTO ? "auto" :
-            params.moe_cache.mode == COMMON_MOE_CACHE_MODE_SOFT ? "soft" : "on";
+            params.moe_cache.mode == COMMON_MOE_CACHE_MODE_SOFT ? "soft" : "budget";
         const char * placement = params.moe_cache.fit_selected ? " placement=cache-aware-fit" : "";
         if (params.moe_cache.mode == COMMON_MOE_CACHE_MODE_OFF) {
             COM_INF("%s", "MoE cache: mode=off\n");

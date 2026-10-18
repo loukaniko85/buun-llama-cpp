@@ -11245,7 +11245,7 @@ private:
             // negative sentinel means the loader's negative-is-all default.
             ngl_eff = params_base.n_gpu_layers >= 0
                 ? params_base.n_gpu_layers
-                : llama_model_n_layer(model_tgt) + 1;
+                : llama_model_n_layer(model_tgt) + llama_model_n_layer_nextn(model_tgt) + 1;
             if (ngl_eff > 0 && !gpu_identities.empty()) {
                 std::vector<float> resolved_split(gpu_identities.size());
                 const size_t resolved_count =

@@ -3,6 +3,7 @@
 #include "moe-cache-mmv-tuning.h"
 #include "moe-cache.cuh"
 #include "moe-cpu-share.cuh"
+#include "moe-tier.cuh"
 #include "quantize.cuh"
 #include "fwht.cuh"
 #include "unary.cuh"
@@ -1966,6 +1967,24 @@ static __global__ void mul_mat_vec_q_moe(
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
+    // The iq2_xxs grid staged in shared memory: a warp's scattered codebook reads then cost bank
+    // conflicts instead of one L1 wavefront per distinct line. iq2_s's 8 KiB grid costs more to stage than it saves.
+    constexpr bool grid_smem = type == GGML_TYPE_IQ2_XXS;
+    __shared__ uint64_t grid_s[grid_smem ? 256 : 1];
+    if constexpr (grid_smem) {
+        for (int i = threadIdx.y*warp_size + threadIdx.x; i < 256; i += blockDim.y*warp_size) {
+            grid_s[i] = iq2xxs_grid[i];
+        }
+        __syncthreads();
+    }
+    const auto vec_dot = [&](const void * v, const block_q8_1 * yb, const int kbx, const int kqs) {
+        if constexpr (grid_smem) {
+            return vec_dot_iq2_xxs_q8_1_grid(v, yb, kbx, kqs, grid_s);
+        } else {
+            return vec_dot_q_cuda(v, yb, kbx, kqs);
+        }
+    };
+
     const bool shared_expert = !flat_hits && has_fusion && fusion.shared_up && blockIdx.y == gridDim.y - 1;
     if (shared_expert) {
         vx = fusion.shared_up;
@@ -2077,10 +2096,10 @@ static __global__ void mul_mat_vec_q_moe(
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
             if (uint32_t(row0 + i) < nrows_x) {
-                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                tmp[i] += vec_dot(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], gate_kbx_offset + i*stride_row_x + kbx, kqs);
+                        tmp_gate[i] += vec_dot(vgate, &y[kby], gate_kbx_offset + i*stride_row_x + kbx, kqs);
                     }
                 }
             }
@@ -2341,6 +2360,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
 
     const bool has_ids = ids != nullptr;
+    const bool is_nvidia_turing_plus = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
 
     // How the K loop divides up at the baseline block width, both decisions below use these.
     constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
@@ -2369,7 +2389,6 @@ static void mul_mat_vec_q_switch_ncols_dst(
             GGML_TYPE_Q3_K,
         };
 
-        const bool is_nvidia_turing_plus  = GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_TURING;
         const bool is_nvidia_pascal_older = GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA;
 
         if (is_nvidia_turing_plus) {
@@ -2408,7 +2427,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return idle * 8 <= iters_wide * 2;
     };
 
-    if (has_ids && (ncols_dst > 1 || fusion.x_table)) {
+    // A single token's iq2_xxs experts are faster through the packed kernel with its shared-memory
+    // codebook (tuned on Ampere); other types measured neutral or slower there.
+    const bool packed_one_token = type == GGML_TYPE_IQ2_XXS && is_nvidia_turing_plus;
+    if (has_ids && (ncols_dst > 1 || fusion.x_table || packed_one_token)) {
         // Multi-token or device-routed MUL_MAT_ID path - dedicated MoE kernel
         mul_mat_vec_q_moe_launch<type>(
             vx, vy, ids, nullptr, nullptr, nullptr, fusion, dst,
@@ -2899,13 +2921,15 @@ static void ggml_cuda_mul_mat_vec_q_impl(
         fusion_local.x_table = x_route.table;
         fusion_local.x_route_log = x_route.log;
         ggml_moe_cache_route_table gate_route;
-        if (fusion && fusion->gate && ggml_moe_cache_route_find(fusion->gate->data, gate_route)) {
+        const bool gate_routed = fusion && fusion->gate && ggml_moe_cache_route_find(fusion->gate->data, gate_route);
+        if (gate_routed) {
             fusion_local.gate_table = gate_route.table;
             fusion_local.gate_route_log = gate_route.log;
             fusion_local.share = ggml_moe_cpu_share_begin(src0, fusion->gate, ids, src1, fusion, stream);
         } else if (!fusion) {
             fusion_local.share = ggml_moe_cpu_share_down(src0, ids, dst);
         }
+        ggml_moe_tier_resolve(x_route, gate_routed ? &gate_route : nullptr, ids, src1, stream);
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

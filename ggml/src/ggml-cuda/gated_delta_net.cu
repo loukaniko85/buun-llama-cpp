@@ -130,17 +130,26 @@ gated_delta_net_cuda(const float * q,
         GGML_UNUSED(l2_norm);
 #endif
 
-        if constexpr (!KDA && cols_per_warp == 4) {
+        if constexpr (cols_per_warp == 4) {
             // Interleave independent columns without changing each column's
             // FMA or XOR reduction order. The existing SM86 prefill dispatcher
-            // alone selects this four-column geometry.
-            const float g_val = GDN_EXPF(*g_t);
+            // alone selects this four-column geometry. KDA's per-channel decay
+            // is computed once per row and shared by the four columns.
+            float g_row[rows_per_lane];
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+                g_row[r] = GDN_EXPF(KDA ? g_t[r * warp_size + lane] : *g_t);
+            }
             float kv[cols_per_warp] = {}, delta[cols_per_warp], output[cols_per_warp] = {};
 #pragma unroll
             for (int r = 0; r < rows_per_lane; ++r) {
 #pragma unroll
                 for (int c = 0; c < cols_per_warp; ++c) {
-                    kv[c] += s_shards[c][r] * k_reg[r];
+                    if constexpr (KDA) {
+                        kv[c] += g_row[r] * s_shards[c][r] * k_reg[r];
+                    } else {
+                        kv[c] += s_shards[c][r] * k_reg[r];
+                    }
                 }
             }
 #pragma unroll
@@ -152,13 +161,13 @@ gated_delta_net_cuda(const float * q,
             }
 #pragma unroll
             for (int c = 0; c < cols_per_warp; ++c) {
-                delta[c] = (v_t[col + c] - g_val * kv[c]) * beta_val;
+                delta[c] = (v_t[col + c] - (KDA ? kv[c] : g_row[0] * kv[c])) * beta_val;
             }
 #pragma unroll
             for (int r = 0; r < rows_per_lane; ++r) {
 #pragma unroll
                 for (int c = 0; c < cols_per_warp; ++c) {
-                    s_shards[c][r] = g_val * s_shards[c][r] + k_reg[r] * delta[c];
+                    s_shards[c][r] = g_row[r] * s_shards[c][r] + k_reg[r] * delta[c];
                     output[c] += s_shards[c][r] * q_reg[r];
                 }
             }
@@ -208,7 +217,7 @@ gated_delta_net_cuda(const float * q,
                 }
             }
         } else {
-            static_assert(cols_per_warp == 1, "KDA retains its original column mapping");
+            static_assert(cols_per_warp == 1, "KDA fallback is single-column");
             float * s_shard = s_shards[0];
             // kv[col] = sum_i g[i] * S[i][col] * k[i]
             float kv_shard = 0.0f;
@@ -319,17 +328,15 @@ static void launch_gated_delta_net(
             }
             case 128: {
 #if !defined(GGML_USE_HIP)
-                if constexpr (!KDA) {
-                    if (!input_rows && n_tokens >= 256 &&
-                        ggml_cuda_info().devices[ggml_cuda_get_device()].cc == 860) {
-                        const dim3 paired_grid(H, n_seqs, S_v / (num_warps * 4));
-                        const auto paired_launch = ggml_cuda_kernel_launch_params(paired_grid, block_dims, 0, stream);
-                        ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, keep_rs_t, sum_eps_t, false, 4>, paired_launch,
-                            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
-                            n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, l2_norm, input_rows);
-                        break;
-                    }
+                if (!input_rows && n_tokens >= 256 &&
+                    ggml_cuda_info().devices[ggml_cuda_get_device()].cc == 860) {
+                    const dim3 paired_grid(H, n_seqs, S_v / (num_warps * 4));
+                    const auto paired_launch = ggml_cuda_kernel_launch_params(paired_grid, block_dims, 0, stream);
+                    ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, sum_eps_t, false, 4>, paired_launch,
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                        n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, l2_norm, input_rows);
+                    break;
                 }
 #endif
                 if constexpr (!KDA && keep_rs_t) {
