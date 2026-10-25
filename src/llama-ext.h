@@ -161,14 +161,25 @@ LLAMA_API size_t llama_model_get_moe_tensor_info(
 // This is intentionally about resolved placement, not architecture metadata.
 LLAMA_API bool llama_model_has_host_moe_weights(const struct llama_model * model);
 
+// Split mode the model was loaded with (after split mode auto resolved it).
+LLAMA_API enum llama_split_mode llama_model_split_mode(const struct llama_model * model);
+
 // Bytes of host-resident weights a GPU copies in to run a large batch (op offload, MoE cache
 // misses), with the resolved placement. Token embeddings are excluded: their row lookups stay on the host.
+// So are MTP blocks, which only the draft context runs.
 LLAMA_API size_t llama_model_host_offload_weight_bytes(const struct llama_model * model);
 
 // The largest 2D block weight (routed experts and the embedding/output matrices aside), the
 // matmul that dominates a dense prefill. Returns false when the model has none.
 LLAMA_API bool llama_model_largest_block_weight(
         const struct llama_model * model, enum ggml_type * type, int64_t * ne0, int64_t * ne1);
+
+// Whether the architecture has split rules for LLAMA_SPLIT_MODE_TENSOR.
+LLAMA_API bool llama_model_supports_split_tensor(const struct llama_model * model);
+
+// The number of attention layers that llama_model_params::n_attn_owned can hold whole on one device each,
+// 0 when the architecture mirrors its latent KV caches under LLAMA_SPLIT_MODE_TENSOR.
+LLAMA_API int32_t llama_model_n_attn_ownable(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
@@ -304,3 +315,10 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+// Build the runtime compact MTP draft head (llamAmpere 65K shortlist) for a
+// built-in nextn-head model without a sidecar d2t. Idempotent; a logged no-op
+// when the model is ineligible (sidecar d2t, tokenizer mismatch, LoRA adapters,
+// speculative-scale head, split/host head buffer, LLAMA_MTP_VOCAB_MAP=0).
+// See src/llama-mtp-vocab.h.
+LLAMA_API bool llama_model_init_mtp_draft_vocab(const struct llama_model * model);

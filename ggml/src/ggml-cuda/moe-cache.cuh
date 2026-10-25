@@ -37,6 +37,9 @@ struct ggml_moe_cache_route_table {
     int32_t * log = nullptr;
     const void * scales[2] = {nullptr, nullptr};
     ggml_moe_tier_route * tier = nullptr;
+    // device view of an untiered route's host expert bytes (tiered: null, the tier arena holds them)
+    const char * host_lo = nullptr;
+    const char * host_hi = nullptr;
 };
 
 // False when the host expert tensor at host_base is not device-routed.

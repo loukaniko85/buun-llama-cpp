@@ -16,7 +16,7 @@ bool ggml_moe_tier_enabled() {
     return false;
 }
 
-ggml_moe_tier * ggml_moe_tier_create(int, cudaStream_t) {
+ggml_moe_tier * ggml_moe_tier_create(int, int, cudaStream_t) {
     return nullptr;
 }
 
@@ -41,6 +41,11 @@ void ggml_moe_tier_unpin(ggml_moe_tier_route *, int32_t) {
 }
 
 void ggml_moe_tier_set_vram(ggml_moe_tier_route *, int32_t, bool) {
+}
+
+void ggml_moe_tier_arena(const ggml_moe_tier_route *, const char ** lo, const char ** hi) {
+    *lo = nullptr;
+    *hi = nullptr;
 }
 
 void ggml_moe_tier_prefill(ggml_moe_tier_route *, uint32_t *, bool, char *, cudaStream_t) {
@@ -147,6 +152,7 @@ struct ggml_moe_tier {
 
     size_t budget = 0;
     size_t claimed = 0; // of g_moe_tier_claimed
+    size_t n_expert = 0; // of the routes: slots past one each would never fill
     size_t expert_max = 0; // sizes the slots when the arena is reserved
 
     // Reserved whole at the first resolve so table entries in it are recognizable;
@@ -188,6 +194,7 @@ struct ggml_moe_tier {
     std::atomic<bool> retry{false};
     std::thread thread;
     std::thread grower;
+    std::condition_variable grow_cv; // a route added, or stopping
 
     std::atomic<long long> loads{0};
     std::atomic<long long> load_failures{0};
@@ -636,9 +643,11 @@ static size_t moe_tier_cgroup_room() {
     return room;
 }
 
-// auto budgets claimed by live tiers, so devices do not each spend the same headroom
+// auto budgets claimed by live tiers, so tiers do not each spend the same headroom, out of
+// the headroom when the first of them started
 static std::mutex g_moe_tier_claim_mu;
 static size_t g_moe_tier_claimed = 0;
+static size_t g_moe_tier_pool = 0;
 
 // Host memory free to pin now, less the margin left for everything else.
 static size_t moe_tier_headroom() {
@@ -652,18 +661,20 @@ static size_t moe_tier_headroom() {
     return room != SIZE_MAX && room > margin ? room - margin : 0;
 }
 
-static size_t moe_tier_budget(size_t & claimed) {
+// An auto budget is claimed until ggml_moe_tier_free returns it.
+static size_t moe_tier_budget(int n_share, size_t & claimed) {
     const char * value = getenv("GGML_CUDA_MOE_TIER");
     if (strcmp(value, "auto") != 0) {
         return (size_t) strtoull(value, nullptr, 10) << 20;
     }
-    size_t room = moe_tier_headroom();
-    // an arena already pinned is out of room too; counting it twice errs small
     std::lock_guard<std::mutex> lock(g_moe_tier_claim_mu);
-    room = room > g_moe_tier_claimed ? room - g_moe_tier_claimed : 0;
-    g_moe_tier_claimed += room;
-    claimed = room;
-    return room;
+    if (g_moe_tier_claimed == 0) {
+        g_moe_tier_pool = moe_tier_headroom();
+    }
+    const size_t left = g_moe_tier_pool > g_moe_tier_claimed ? g_moe_tier_pool - g_moe_tier_claimed : 0;
+    claimed = std::min(left, g_moe_tier_pool / (size_t) n_share);
+    g_moe_tier_claimed += claimed;
+    return claimed;
 }
 
 static bool moe_tier_register(ggml_moe_tier * tier, int first, int count) {
@@ -700,11 +711,23 @@ static int moe_tier_chunk_slots(const ggml_moe_tier * tier) {
 
 // Pins the rest of the arena in the background, a chunk at a time, while the
 // host still has room: the budget is a snapshot from before the first prompt.
+// Pins no more slots than the routes have experts, waiting for later routes.
 static void moe_tier_grow(ggml_moe_tier * tier) {
     ggml_cuda_set_device(tier->device);
     int first = tier->n_ready;
-    while (!tier->stopping.load() && first < (int) tier->slots.size()) {
-        const int count = std::min(moe_tier_chunk_slots(tier), (int) tier->slots.size() - first);
+    while (first < (int) tier->slots.size()) {
+        int cap = 0;
+        {
+            std::unique_lock<std::mutex> lock(tier->mu);
+            tier->grow_cv.wait(lock, [&] {
+                cap = (int) std::min(tier->slots.size(), std::max(tier->n_expert, (size_t) moe_tier_slots_min));
+                return tier->stopping.load() || first < cap;
+            });
+        }
+        if (tier->stopping.load()) {
+            break;
+        }
+        const int count = std::min(moe_tier_chunk_slots(tier), cap - first);
         if (moe_tier_headroom() < (size_t) count * tier->slot_bytes) {
             GGML_LOG_INFO("moe tier: device %d: RAM arena stops at %.1f GiB: host headroom\n", tier->device,
                     (double) first * tier->slot_bytes / (1ull << 30));
@@ -1012,7 +1035,11 @@ void ggml_moe_tier_free(ggml_moe_tier * tier) {
     if (!tier) {
         return;
     }
-    tier->stopping = true;
+    {
+        std::lock_guard<std::mutex> lock(tier->mu);
+        tier->stopping = true;
+    }
+    tier->grow_cv.notify_all();
     if (tier->thread.joinable()) {
         tier->thread.join();
     }
@@ -1059,14 +1086,14 @@ static size_t moe_tier_slot_bytes(size_t expert_size) {
     return ggml_moe_store_span(GGML_MOE_STORE_ALIGN - 1, expert_size);
 }
 
-ggml_moe_tier * ggml_moe_tier_create(int device, cudaStream_t stream) {
+ggml_moe_tier * ggml_moe_tier_create(int device, int n_share, cudaStream_t stream) {
     if (!ggml_moe_tier_enabled()) {
         return nullptr;
     }
     auto tier = new ggml_moe_tier;
     tier->device = device;
     tier->stream = stream;
-    tier->budget = moe_tier_budget(tier->claimed);
+    tier->budget = moe_tier_budget(n_share, tier->claimed);
 
     ggml_cuda_set_device(device);
     cudaError_t error = cudaHostAlloc((void **) &tier->box, sizeof(moe_tier_box), cudaHostAllocMapped | cudaHostAllocPortable);
@@ -1218,6 +1245,8 @@ ggml_moe_tier_route * ggml_moe_tier_route_add(ggml_moe_tier * tier, const void *
     route->file = file->second;
     route->id = (int) tier->routes.size();
     tier->expert_max = std::max(tier->expert_max, expert_size);
+    tier->n_expert += (size_t) n_expert;
+    tier->grow_cv.notify_all();
     tier->routes.push_back(std::move(route));
     return tier->routes.back().get();
 }
@@ -1265,6 +1294,11 @@ void ggml_moe_tier_unpin(ggml_moe_tier_route * route, int32_t expert) {
 
 void ggml_moe_tier_set_vram(ggml_moe_tier_route * route, int32_t expert, bool vram) {
     route->vram[expert].store(vram, std::memory_order_relaxed);
+}
+
+void ggml_moe_tier_arena(const ggml_moe_tier_route * route, const char ** lo, const char ** hi) {
+    *lo = route->tier->arena;
+    *hi = route->tier->arena + route->tier->reserved;
 }
 
 static void moe_tier_staged_done(void * user, bool ok) {

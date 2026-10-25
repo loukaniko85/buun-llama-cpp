@@ -659,6 +659,7 @@ struct llama_device {
 struct llama_meta_device_get_split_state_userdata {
     size_t                     n_devices;
     const struct llama_model * model;
+    int32_t                    n_attn_owned; // llama_model_params::n_attn_owned
 };
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
@@ -754,6 +755,19 @@ struct llama_model {
     struct ggml_tensor * fc_s = nullptr;
     struct ggml_tensor * fc_in_s = nullptr;
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
+
+    // runtime compact MTP draft head for built-in nextn models without a sidecar
+    // d2t (built by llama_model_init_mtp_draft_vocab, src/llama-mtp-vocab.cpp;
+    // consumed by arch graph builds under cparams.embeddings_nextn_masked, i.e.
+    // draft decodes only). ids: I32 [n_sel]; compact: [n_embd, n_sel] in the
+    // output head's own quant type (bit-identical row gather).
+    struct mtp_draft_vocab_state {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+        struct ggml_tensor * ids     = nullptr;
+        struct ggml_tensor * compact = nullptr;
+        bool                   attempted = false;
+    } mtp_draft_vocab;
 
     // dspark
     struct ggml_tensor * dspark_markov_w1   = nullptr;

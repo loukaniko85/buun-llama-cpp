@@ -748,6 +748,85 @@ bool ggml_cuda_exl3_mul_mat_id_fast(const ggml_tensor * dst) {
     return exl3_int8_mode() != 0 && exl3_mul_mat_id_fast_shape(dst);
 }
 
+// The grouped kernel keeps few loads in flight: reading zero-copy host memory through an IOMMU
+// it pays a translation miss per page and falls to ~4 GB/s, while a streaming copy runs near
+// link rate. Routed launches therefore copy their host-resident experts into VRAM scratch first.
+static int exl3_stage_slots(int64_t pairs, int64_t n_expert, size_t expert_size) {
+    static const int slots = [] {
+        int64_t value = 16;
+        moe_cache_env_i64("GGML_CUDA_MOE_STAGE", 0, 256, value);
+        return int(value);
+    }();
+    if (expert_size % sizeof(int4) != 0) {
+        return 0;
+    }
+    return int(std::min<int64_t>({slots, pairs, n_expert}));
+}
+
+// One block: copies the table to out, then points up to slots distinct selected experts that live
+// in host memory [lo, hi) at scratch and lists their sources after the table (null past the last).
+static __global__ void exl3_stage_plan(const void * const * table, const int32_t * ids, int n_used, int n_rows,
+        int64_t stride, int n_expert, const char * lo, const char * hi, char * scratch, size_t expert_size, int slots,
+        const void ** out) {
+    extern __shared__ uint32_t used[];
+    __shared__ int n_staged;
+    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
+        out[e] = table[e];
+    }
+    for (int i = threadIdx.x; i < (n_expert + 31) / 32; i += blockDim.x) {
+        used[i] = 0;
+    }
+    if (threadIdx.x == 0) {
+        n_staged = 0;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < n_used * n_rows; i += blockDim.x) {
+        const int32_t e = ids[(i / n_used) * stride + i % n_used];
+        if (e < 0 || e >= n_expert) {
+            continue;
+        }
+        const char * p = (const char *) table[e];
+        const uint32_t bit = 1u << (e % 32);
+        if (p >= lo && p < hi && !(atomicOr(&used[e / 32], bit) & bit)) {
+            const int k = atomicAdd(&n_staged, 1);
+            if (k < slots) {
+                out[n_expert + k] = p;
+                out[e] = scratch + k * expert_size;
+            }
+        }
+    }
+    __syncthreads();
+    for (int k = n_staged + threadIdx.x; k < slots; k += blockDim.x) {
+        out[n_expert + k] = nullptr;
+    }
+}
+
+// grid (blocks per expert, slots): four independent 16-byte loads in flight per thread
+static __global__ void exl3_stage_copy(const void * const * src, char * scratch, size_t expert_size) {
+    const int4 * s = (const int4 *) src[blockIdx.y];
+    if (!s) {
+        return;
+    }
+    int4 * d = (int4 *) (scratch + blockIdx.y * expert_size);
+    const size_t n = expert_size / sizeof(int4);
+    const size_t step = size_t(gridDim.x) * blockDim.x;
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += 4 * step) {
+        int4 v[4];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (i + j * step < n) {
+                v[j] = s[i + j * step];
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            if (i + j * step < n) {
+                d[i + j * step] = v[j];
+            }
+        }
+    }
+}
+
 void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * w = dst->src[0], * x = dst->src[1], * ids = dst->src[2];
     const ggml_tensor * svh = dst->src[3], * suh = dst->src[4];
@@ -765,7 +844,10 @@ void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     ga.expert_stride = w->nb[2];
     const void * svh_data = svh->data, * suh_data = suh->data;
     cudaStream_t stream = ctx.stream();
+    const int pairs = int(ids->ne[0] * ids->ne[1]);
     ggml_moe_cache_route_table route;
+    ggml_cuda_pool_alloc<const void *> stage_table(ctx.pool());
+    ggml_cuda_pool_alloc<char> stage_scratch(ctx.pool());
     if (ggml_moe_cache_route_find(w->data, route)) {
         ga.table     = route.table;
         ga.route_log = route.log;
@@ -774,8 +856,21 @@ void ggml_cuda_mul_mat_id_exl3(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             suh_data = route.scales[1];
         }
         ggml_moe_tier_resolve(route, nullptr, ids, x, stream);
+        const int64_t n_expert = w->ne[2];
+        const int slots = exl3_stage_slots(pairs, n_expert, w->nb[2]);
+        if (slots > 0) {
+            if (route.tier) {
+                ggml_moe_tier_arena(route.tier, &route.host_lo, &route.host_hi);
+            }
+            stage_table.alloc(n_expert + slots);
+            stage_scratch.alloc(size_t(slots) * w->nb[2]);
+            exl3_stage_plan<<<1, 256, (n_expert + 31) / 32 * sizeof(uint32_t), stream>>>(route.table, ga.ids,
+                    ga.n_expert_used, int(ids->ne[1]), ga.ids_nb1, int(n_expert), route.host_lo, route.host_hi,
+                    stage_scratch.get(), w->nb[2], slots, stage_table.get());
+            exl3_stage_copy<<<dim3(64, slots), 256, 0, stream>>>(stage_table.get() + n_expert, stage_scratch.get(), w->nb[2]);
+            ga.table = stage_table.get();
+        }
     }
-    const int pairs = int(ids->ne[0] * ids->ne[1]);
     EXL3_DISPATCH(exl3_moe_run, bits, cb, ctx, static_cast<const float *>(x->data), static_cast<const half *>(suh_data),
         static_cast<const uint8_t *>(w->data), static_cast<const half *>(svh_data), static_cast<float *>(dst->data), k, n, pairs, ga, stream);
 }

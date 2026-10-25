@@ -177,8 +177,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             for (size_t i = 0; i < n_devs; ++i) {
                 LLAMA_LOG_INFO("%s: - device %zu: %s\n", __func__, i, ggml_backend_dev_name(params.devices[i]));
             }
-            model->get_split_state_ud.n_devices = n_devs;
-            model->get_split_state_ud.model = model;
+            model->get_split_state_ud = {n_devs, model, params.n_attn_owned};
             model->devices.push_back({
                 true, ggml_backend_meta_device(
                 params.devices, n_devs, llama_meta_device_get_split_state, &model->get_split_state_ud)
@@ -218,8 +217,7 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             }
 
             GGML_ASSERT(!devs.empty());
-            model->get_split_state_ud.n_devices = devs.size();
-            model->get_split_state_ud.model     = model;
+            model->get_split_state_ud = {devs.size(), model, params.n_attn_owned};
             gpus.push_back({
                 true, ggml_backend_meta_device(
                 devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)

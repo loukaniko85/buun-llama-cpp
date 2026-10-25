@@ -361,6 +361,10 @@ extern "C" {
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
         int32_t main_gpu;
 
+        // with LLAMA_SPLIT_MODE_TENSOR, the number of attention layers held whole by one device each (round robin)
+        // instead of mirroring their latent KV caches on every device, -1 = unset (none)
+        int32_t n_attn_owned;
+
         // proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         const float * tensor_split;
 

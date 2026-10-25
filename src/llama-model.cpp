@@ -495,9 +495,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // Expert parallelism needs every routed row to stay on one device between the up/gate projection and
     // the down projection; per-expert biases (added on all devices as partial sums) would break that, so
     // models with expert biases keep the sliced layout until the bias add learns the expert window.
+    // Slicing decodes faster on the models measured, so expert parallelism is opt-in (LLAMA_SPLIT_EXPERTS=parallel).
     static const bool expert_parallel_env = [] {
         const char * env = std::getenv("LLAMA_SPLIT_EXPERTS");
-        return env == nullptr || std::string(env) != "slice";
+        return env != nullptr && std::string(env) == "parallel";
     }();
     const bool expert_parallel = expert_parallel_env &&
         ud->model->get_tensor("blk.0.ffn_down_exps.bias") == nullptr &&
@@ -523,20 +524,20 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         size_t   rotation; // when assigning tensor slices, rotate how the rounding is done for more even allocation
     };
 
+    // the layers in a tensor can be inhomogeneous, if the pattern is cleanly divided by the number of GPUs there can be aliasing effects,
+    //     count only the same type of previous layers to avoid this
+    auto get_il_eff = [&](const size_t il){
+        size_t ret = 0;
+        const bool il_is_recr = hparams.is_recr(il);
+        const bool il_is_swa  = hparams.is_swa(il);
+        for (size_t il_prev = 0; il_prev < il; il_prev++) {
+            ret += hparams.is_recr(il_prev) == il_is_recr && hparams.is_swa(il_prev) == il_is_swa;
+        }
+        return ret;
+    };
+
     auto get_tensor_config_impl = [&](
                 const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "") -> tensor_config {
-        // the layers in a tensor can be inhomogeneous, if the pattern is cleanly divided by the number of GPUs there can be aliasing effects,
-        //     count only the same type of previous layers to avoid this
-        auto get_il_eff = [&](const size_t il){
-            size_t ret = 0;
-            const bool il_is_recr = hparams.is_recr(il);
-            const bool il_is_swa  = hparams.is_swa(il);
-            for (size_t il_prev = 0; il_prev < il; il_prev++) {
-                ret += hparams.is_recr(il_prev) == il_is_recr && hparams.is_swa(il_prev) == il_is_swa;
-            }
-            return ret;
-        };
-
         uint32_t il;
         std::string prefix;
         // NOTE: the per-layer rotation spreads shard bytes evenly across devices regardless of
@@ -733,10 +734,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
-        // Stacked expert tensors: expert parallelism keeps whole experts per device (split on the expert
-        // axis) instead of slicing every expert across all devices; the MUL_MAT_ID nodes get a per-device
-        // expert window and the expert outputs are reduced once per layer. LLAMA_SPLIT_EXPERTS=slice restores
-        // the sliced layout.
+        // Stacked expert tensors: expert parallelism (LLAMA_SPLIT_EXPERTS=parallel) keeps whole experts per
+        // device (split on the expert axis) instead of slicing every expert across all devices; the MUL_MAT_ID
+        // nodes get a per-device expert window and the expert outputs are reduced once per layer.
         if (expert_parallel && tensor->ne[2] > 1 &&
                 (std::regex_match(tensor_name, pattern_ffn_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_gate_exps_any) ||
                  std::regex_match(tensor_name, pattern_ffn_gate_up_exps_any) || std::regex_match(tensor_name, pattern_ffn_down_exps_any))) {
@@ -1110,6 +1110,33 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
 
     ggml_backend_meta_split_state split_state;
     memset(&split_state, 0, sizeof(split_state));
+
+    // GLM DSA owner placement: an owned DSA layer (MLA + its own indexer and both caches) lives whole on one
+    // device, round-robin over the DSA layers, instead of mirroring its latent caches on every device.
+    // Its output projection splits on axis 0, so the layer ends in the usual partial-sum all-reduce.
+    static const std::regex pattern_glm_dsa_attn(
+        "blk\\.\\d+\\.(attn_(q_a_norm|kv_a_norm|q_a|q_b|kv_a_mqa|k_b|v_b)\\.(weight|scale|input_scale)|indexer[._].*)");
+    const int32_t n_attn_owned = ud->n_attn_owned;
+    if (n_attn_owned > 0 && ud->n_devices > 1 && llama_model_n_attn_ownable(ud->model) > 0) {
+        // pattern_kv_cache also matches the indexer caches
+        const bool cache = std::regex_match(tensor_name, pattern_kv_cache);
+        const bool out = !cache && std::regex_match(tensor_name, pattern_attn_out_weight);
+        if (cache || out || std::regex_match(tensor_name, pattern_glm_dsa_attn)) {
+            const tensor_config tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            if (!hparams.is_recr(tc.il) && get_il_eff(tc.il) < size_t(n_attn_owned)) {
+                // rotation counts the DSA layers before this one, so it is the owner
+                // (the axis only matters for the output projection and for the EXL3 vectors that follow it)
+                const bool axis_0 = cache || out || tensor->ne[1] == 1;
+                split_state.axis = axis_0 ? GGML_BACKEND_SPLIT_AXIS_0 :
+                    tensor->ne[2] > 1 ? GGML_BACKEND_SPLIT_AXIS_2 : GGML_BACKEND_SPLIT_AXIS_1;
+                split_state.ne[tc.rotation] = tensor->ne[split_state.axis];
+                split_state.nr[0] = 1;
+                split_state.n_segments = 1;
+                return split_state;
+            }
+        }
+    }
+
     tensor_config tc = get_tensor_config();
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
@@ -4020,6 +4047,7 @@ llama_model_params llama_model_default_params() {
         /*.mmap_prefetch               =*/ LLAMA_MMAP_PREFETCH_MODE_AUTO,
         /*.repack_cache                =*/ nullptr,
         /*.main_gpu                    =*/ 0,
+        /*.n_attn_owned                =*/ -1,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
@@ -5082,23 +5110,25 @@ int32_t llama_model_n_expert_used(const struct llama_model * model) {
     return model->hparams.n_expert_used_max();
 }
 
+// block index of a "blk.<il>." tensor, -1 for other tensors
+static int64_t llama_model_tensor_layer(const std::string & name) {
+    if (name.compare(0, 4, "blk.") != 0) {
+        return -1;
+    }
+    char * end = nullptr;
+    const long parsed = strtol(name.c_str() + 4, &end, 10);
+    return end != name.c_str() + 4 ? parsed : -1;
+}
+
 static bool llama_model_is_routed_expert_weight(
         const std::string & name, const ggml_tensor * tensor) {
     if (!tensor) {
         return false;
     }
-    bool has_suffix = false;
-    {
-        if (name.size() >= strlen("_exps.weight") &&
-            name.compare(name.size() - strlen("_exps.weight"), strlen("_exps.weight"), "_exps.weight") == 0) {
-            has_suffix = true;
-        } else if (name.size() >= strlen("_chexps.weight") &&
-                   name.compare(name.size() - strlen("_chexps.weight"), strlen("_chexps.weight"), "_chexps.weight") == 0) {
-            has_suffix = true;
-        }
-    }
-    return has_suffix && name.find(".ffn_") != std::string::npos &&
-        ggml_n_dims(tensor) == 3 && tensor->ne[0] > 0 &&
+    // mixed-precision expert banks store each precision group as <base>.g<i>.weight
+    static const std::regex routed(R"(_(ch)?exps(\.g[0-9]+)?\.weight$)");
+    return std::regex_search(name, routed) && name.find(".ffn_") != std::string::npos &&
+        tensor->ne[3] == 1 && tensor->ne[0] > 0 && // single-expert groups are [K,N,1]
         tensor->ne[1] > 0 && tensor->ne[2] > 0 && tensor->nb[2] != 0;
 }
 
@@ -5114,15 +5144,7 @@ size_t llama_model_get_moe_tensor_info(
             continue;
         }
 
-        int64_t layer = -1;
-        if (name.compare(0, 4, "blk.") == 0) {
-            char * end = nullptr;
-            const long parsed = strtol(name.c_str() + 4, &end, 10);
-            if (end != name.c_str() + 4) {
-                layer = parsed;
-            }
-        }
-
+        const int64_t layer = llama_model_tensor_layer(name);
         if (info && count < capacity) {
             info[count] = {
                 tensor->type,
@@ -5136,6 +5158,10 @@ size_t llama_model_get_moe_tensor_info(
         count++;
     }
     return count;
+}
+
+llama_split_mode llama_model_split_mode(const llama_model * model) {
+    return model->split_mode();
 }
 
 bool llama_model_has_host_moe_weights(const llama_model * model) {
@@ -5157,8 +5183,13 @@ bool llama_model_has_host_moe_weights(const llama_model * model) {
 }
 
 size_t llama_model_host_offload_weight_bytes(const llama_model * model) {
+    // MTP blocks run only in the draft context, never in a target batch
+    const int64_t il_draft = model->hparams.has_mtp() ? (int64_t) model->hparams.n_layer() : INT64_MAX;
     size_t bytes = 0;
     for (const auto & [name, tensor] : model->tensors_by_name) {
+        if (llama_model_tensor_layer(name) >= il_draft) {
+            continue;
+        }
         // token embeddings are row lookups, which stay on the host
         if (tensor->view_src == nullptr && tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer) &&
                 name.find("token_embd") == std::string::npos) {
@@ -5184,6 +5215,29 @@ bool llama_model_largest_block_weight(
     *ne0  = best->ne[0];
     *ne1  = best->ne[1];
     return true;
+}
+
+bool llama_model_supports_split_tensor(const llama_model * model) {
+    return llm_arch_supports_sm_tensor(model->arch);
+}
+
+int32_t llama_model_n_attn_ownable(const struct llama_model * model) {
+    if (model->arch != LLM_ARCH_GLM5_NEXT) {
+        return 0;
+    }
+    // a layer that reuses the previous layer's top-k selection would have to share its device, so require full indexers
+    const llama_hparams & hparams = model->hparams;
+    int32_t n = 0;
+    for (uint32_t il = 0; il < hparams.n_layer_all; il++) {
+        if (hparams.is_recr(il)) {
+            continue;
+        }
+        if (il < hparams.n_layer() && !hparams.is_indexer_full(il)) {
+            return 0;
+        }
+        n++;
+    }
+    return n;
 }
 
 int32_t llama_model_n_devices(const struct llama_model * model) {

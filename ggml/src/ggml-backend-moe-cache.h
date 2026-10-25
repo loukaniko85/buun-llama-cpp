@@ -59,6 +59,8 @@ struct ggml_moe_cache_config {
     // 0 selects the provider policy; otherwise the session keeps at most this many
     // devices, preferring those with the most free memory.
     int32_t max_devices;
+    // 1 when the device route also serves file-mapped experts (the RAM tier is on).
+    int32_t route_mapped;
     const char * profile_path;
 };
 

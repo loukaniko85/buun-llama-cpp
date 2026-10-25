@@ -93,6 +93,10 @@ extern "C" {
     GGML_API bool                  ggml_backend_buffer_is_multi_buffer(ggml_backend_buffer_t buffer);
     GGML_API void                  ggml_backend_multi_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
     GGML_API void                  ggml_backend_meta_buffer_set_usage (ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
+    // shards of externally created views belong to the graph of one (scheduler, graph slot);
+    // realloc drops that owner's previous shards, forget drops all of a freed scheduler's
+    GGML_API void                  ggml_backend_meta_set_graph_owner   (const void * sched, int slot, bool realloc);
+    GGML_API void                  ggml_backend_meta_forget_graph_owner(const void * sched);
 
     //
     // Backend (meta)

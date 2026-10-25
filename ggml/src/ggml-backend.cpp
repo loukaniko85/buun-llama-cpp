@@ -2720,6 +2720,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         ggml_moe_cache.session_destroy(sched->moe_cache_session);
         sched->moe_cache_session = NULL;
     }
+    ggml_backend_meta_forget_graph_owner(sched);
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -2757,6 +2758,7 @@ bool ggml_backend_sched_set_graph_slot(ggml_backend_sched_t sched, int slot, con
             ggml_backend_sched_reset(sched);
         }
     }
+    ggml_backend_meta_set_graph_owner(sched, slot, false);
     return sched->is_alloc && graph && sched->alloc_src_graph == graph &&
            sched->alloc_generation == ggml_gallocr_get_generation(sched->galloc);
 }
@@ -2821,6 +2823,9 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
 
+    // tensors initialized from here on belong to this slot's graph, replacing its previous one
+    ggml_backend_meta_set_graph_owner(sched, sched->cur_graph_slot, true);
+
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
@@ -2875,6 +2880,7 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    ggml_backend_meta_set_graph_owner(sched, sched->cur_graph_slot, false);
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }

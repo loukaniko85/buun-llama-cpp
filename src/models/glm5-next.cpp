@@ -320,7 +320,7 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * h_norm = build_norm(h_embd,   layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     ggml_tensor * e_norm = build_norm(tok_embd, layer.nextn.enorm, nullptr, LLM_NORM_RMS, il);
 
-    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0), layer.nextn.eh_proj_s);
+    ggml_tensor * cur = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, e_norm, h_norm, 0), layer.nextn.eh_proj_s, layer.nextn.eh_proj_in_s);
     cb(cur, "mtp_eh_proj", il);
 
     ggml_tensor * inpSA = cur;
@@ -367,7 +367,7 @@ llama_model_glm5_next::graph_mtp::graph_mtp(const llama_model & model, const llm
     ggml_tensor * h_next = cur;
 
     if (layer.nextn.shared_head_head) {
-        cur = build_lora_mm(layer.nextn.shared_head_head, cur, layer.nextn.shared_head_head_s);
+        cur = build_lora_mm(layer.nextn.shared_head_head, cur, layer.nextn.shared_head_head_s, layer.nextn.shared_head_head_in_s);
     } else {
         cur = build_lora_mm(model.output, cur, model.output_s, model.output_in_s);
     }

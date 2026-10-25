@@ -64,6 +64,8 @@ struct share_mailbox {
     uint32_t pad0[31];
     volatile uint32_t done;
     uint32_t pad1[31];
+    volatile float stage_cost;                  // GPU-set: timer ticks per byte of the last staging copy
+    volatile int16_t host_num[GGML_TYPE_COUNT]; // host-set: host share of a layer's misses by up type, in 1/256
     int32_t layer;
     int32_t n_tok;
     int32_t n_expert;
@@ -88,7 +90,20 @@ struct share_state {
     const void * stage[3][share_max_routes];
     int n_copy;
     share_copy copy[3*share_max_staged];
+    uint64_t t_ring;            // timer when the copies were set up
+    unsigned int n_copy_blocks; // stage copy blocks finished
+    uint32_t n_rings;           // layers with misses
 };
+
+static __device__ __forceinline__ uint64_t share_ticks() {
+#if defined(GGML_USE_HIP)
+    return wall_clock64();
+#else
+    uint64_t t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+#endif
+}
 
 struct share_tensor {
     const char * host = nullptr;
@@ -125,7 +140,8 @@ struct share_doorbell_args {
     char * stage;          // share_max_staged slots of 3 tensors x stage_stride bytes, or null
     size_t stage_stride;
     int layer;
-    int gpu_num;
+    int up_type;
+    bool probe;            // the share is balanced, not pinned
     float glu_limit;
     share_mailbox * mb;
     float * mb_x;
@@ -178,6 +194,7 @@ static __global__ void share_doorbell(const share_doorbell_args a) {
     if (threadIdx.x == 0) {
         share_mailbox * mb = a.mb;
         share_state * st = a.st;
+        const int host_num = mb->host_num[a.up_type]; // a bus read, issued before the dedup to overlap it
         int miss_expert[share_max_entries];
         int miss_score[share_max_entries];
         int n_miss = 0;
@@ -195,10 +212,16 @@ static __global__ void share_doorbell(const share_doorbell_args a) {
                 n_miss++;
             }
         }
-        // The host share rounds down: a host expert is slower than a streamed one, so it
-        // only pays when the GPU has others to stream meanwhile. The host takes the
-        // experts with the most bytes on the bus first.
-        const int n_host = min((n_miss*(256 - a.gpu_num)) >> 8, share_max_experts);
+        // The host takes the experts with the most bytes on the bus first.
+        int n_host = min((n_miss*host_num + 128) >> 8, share_max_experts);
+        // A side that gets no misses is never measured again, so now and then it gets one.
+        if (a.probe && (++st->n_rings & 63) == 0) {
+            if (n_host == 0) {
+                n_host = 1;
+            } else if (n_host == n_miss) {
+                n_host--;
+            }
+        }
         int picked[share_max_experts];
         int n_pick = 0;
         for (int score = 3; score > 0 && n_pick < n_host; --score) {
@@ -256,6 +279,7 @@ static __global__ void share_doorbell(const share_doorbell_args a) {
             staged[n_staged++] = miss_expert[j];
         }
         st->n_copy = n_copy;
+        st->t_ring = share_ticks();
         for (int i = 0; i < n; ++i) {
             s_stage[i] = -1;
             for (int j = 0; j < n_staged && s_pick[i] < 0; ++j) {
@@ -288,8 +312,11 @@ static __global__ void share_doorbell(const share_doorbell_args a) {
 }
 
 // Copies the doorbell's staged experts; a no-op launch when the layer streams nothing.
-static __global__ void share_stage_copy(const share_state * st) {
+static __global__ void share_stage_copy(share_state * st, share_mailbox * mb) {
     const int n_copy = st->n_copy;
+    if (!n_copy) {
+        return;
+    }
     const size_t step = (size_t) gridDim.x*blockDim.x;
     for (int c = 0; c < n_copy; ++c) {
         const uint4 * __restrict__ src = st->copy[c].src;
@@ -298,6 +325,14 @@ static __global__ void share_stage_copy(const share_state * st) {
         for (size_t i = blockIdx.x*blockDim.x + threadIdx.x; i < n16; i += step) {
             dst[i] = src[i];
         }
+    }
+    // the last block to finish times the copy, the bus speed the host balances its share against
+    if (ggml_cuda_block_ticket(&st->n_copy_blocks) == gridDim.x - 1 && threadIdx.x == 0) {
+        size_t n16 = 0;
+        for (int c = 0; c < n_copy; ++c) {
+            n16 += st->copy[c].n16;
+        }
+        mb->stage_cost = (float) (share_ticks() - st->t_ring)/(16.0f*n16);
     }
 }
 
@@ -322,6 +357,11 @@ struct share_host {
     share_dev devs[GGML_CUDA_MAX_DEVICES];
     int n_embd = 0;
     int n_threads = 0;
+
+    double ns_per_tick = 1.0; // of the GPU timer
+    // leader-only: measured ns per byte of the staging copy and of a host job by up type, 0 = unknown
+    double bus_cost = 0.0;
+    double host_cost[GGML_TYPE_COUNT] = {};
 
     // launch-time pairing of a layer's gate/up and down
     const void * pending_ids = nullptr;
@@ -362,8 +402,14 @@ struct share_host {
 // destroying a waited-on condvar blocks forever in glibc.
 static share_host & g_share = *new share_host;
 
-// Fraction of a layer's routed misses the GPU streams itself (GGML_CUDA_MOE_CPU_SHARE, default 0.4);
-// -1 when the share is off (a fraction of 1 or more).
+// Fraction of a layer's routed misses the GPU streams itself: GGML_CUDA_MOE_CPU_SHARE pins it,
+// else it starts at 0.4 and the leader balances it by measured speeds; -1 when the share is off
+// (a fraction of 1 or more).
+static bool share_pinned() {
+    static const bool pinned = getenv("GGML_CUDA_MOE_CPU_SHARE") != nullptr;
+    return pinned;
+}
+
 static float share_gpu_fraction() {
     static const float frac = [] {
         const char * value = getenv("GGML_CUDA_MOE_CPU_SHARE");
@@ -467,10 +513,33 @@ static void share_wait(F ready) {
     }
 }
 
+// After a host job of ns: gives the host the share of each up type's misses that finishes with
+// the bus, cost_bus/(cost_bus + cost_host) of them, from the measured ns per byte of each.
+// The speed of the host's kernels differs by type far more than the bus does.
+static void share_balance(share_host & h, double ns) {
+    const auto ema = [](double & cost, double sample) {
+        cost = cost > 0.0 ? cost + (sample - cost)/8 : sample;
+    };
+    ema(h.host_cost[h.cur.up.type], ns/(h.n_expert*(double) (h.cur.up.nb2 + h.cur.gate.nb2 + h.cur.down.nb2)));
+    const float stage_cost = h.mb->stage_cost;
+    if (stage_cost > 0.0f) {
+        ema(h.bus_cost, stage_cost*h.ns_per_tick);
+    }
+    if (h.bus_cost <= 0.0) {
+        return;
+    }
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        if (h.host_cost[t] > 0.0) {
+            h.mb->host_num[t] = (int16_t) lround(256.0*h.bus_cost/(h.bus_cost + h.host_cost[t]));
+        }
+    }
+}
+
 static void share_leader(share_host & h) {
     uint32_t seen = 0;
     for (;;) {
         share_wait([&] { return h.mb->seq != seen; });
+        const auto t0 = std::chrono::steady_clock::now();
         seen = h.mb->seq;
         std::atomic_thread_fence(std::memory_order_acquire);
 
@@ -525,6 +594,9 @@ static void share_leader(share_host & h) {
         }
         std::atomic_thread_fence(std::memory_order_release);
         h.mb->done = seen;
+        if (!share_pinned()) {
+            share_balance(h, std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count());
+        }
     }
 }
 
@@ -572,15 +644,26 @@ static bool share_init(share_host & h, int n_embd) {
     h.y = h.x + (size_t) share_max_tokens*n_embd;
     h.d_y = h.d_x + (size_t) share_max_tokens*n_embd;
     h.n_embd = n_embd;
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+        h.mb->host_num[t] = (int16_t) lroundf((1.0f - share_gpu_fraction())*256.0f);
+    }
+#if defined(GGML_USE_HIP)
+    int khz = 0;
+    if (cudaDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, ggml_cuda_get_device()) == cudaSuccess && khz > 0) {
+        h.ns_per_tick = 1e6/khz;
+    }
+#endif
 
     const char * threads = getenv("GGML_CUDA_MOE_CPU_SHARE_THREADS");
-    h.n_threads = threads ? std::max(1, atoi(threads)) : (int) std::clamp(std::thread::hardware_concurrency()/2, 1u, 6u);
+    // a sixth of the cores (6..32), never more than half: 6 starves the share on large hosts
+    const unsigned hw = std::max(std::thread::hardware_concurrency(), 2u);
+    h.n_threads = threads ? std::max(1, atoi(threads)) : (int) std::min(hw/2, std::clamp(hw/6, 6u, 32u));
     std::thread(share_leader, std::ref(h)).detach();
     for (int tid = 1; tid < h.n_threads; ++tid) {
         std::thread(share_worker, std::ref(h)).detach();
     }
-    GGML_LOG_INFO("%s: moe cpu share: GPU keeps %.0f%% of routed misses, %d host threads\n",
-        __func__, 100.0f*share_gpu_fraction(), h.n_threads);
+    GGML_LOG_INFO("%s: moe cpu share: GPU keeps %.0f%% of routed misses%s, %d host threads\n",
+        __func__, 100.0f*share_gpu_fraction(), share_pinned() ? "" : " until it measures host and bus speed", h.n_threads);
     return true;
 }
 
@@ -747,7 +830,8 @@ ggml_moe_cpu_share_args ggml_moe_cpu_share_begin(
     a.stage = d.stage;
     a.stage_stride = d.stage_stride;
     a.layer = layer;
-    a.gpu_num = (int) lroundf(share_gpu_fraction()*256.0f);
+    a.up_type = l.up.type;
+    a.probe = !share_pinned();
     // Pass the activation with the GPU job, so captured graphs replay their own
     // limit rather than observing mutable launch-time state from another layer.
     a.glu_limit = fusion->glu_limit;
@@ -757,7 +841,7 @@ ggml_moe_cpu_share_args ggml_moe_cpu_share_begin(
     share_doorbell<<<1, 256, 0, stream>>>(a);
     CUDA_CHECK(cudaGetLastError());
     if (d.stage) {
-        share_stage_copy<<<2*ggml_cuda_info().devices[device].nsm, 256, 0, stream>>>(d.st);
+        share_stage_copy<<<2*ggml_cuda_info().devices[device].nsm, 256, 0, stream>>>(d.st, h.d_mb);
         CUDA_CHECK(cudaGetLastError());
     }
 

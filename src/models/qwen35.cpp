@@ -751,11 +751,27 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
     ggml_tensor * head_in_s = layer.nextn.shared_head_head ?
         layer.nextn.shared_head_head_in_s : model.output_in_s;
+
+    // Runtime compact draft head (llama-mtp-vocab): when building for the DRAFT
+    // context (embeddings_nextn_masked) and the model has no sidecar d2t, score
+    // against the 65K-row gather of the LM head. The d2t scatter below maps the
+    // ids back to the full-vocab domain, so downstream verify/sampling never has
+    // to know about the trim.
+    ggml_tensor * d2t_eff = model.d2t;
+    if (d2t_eff == nullptr && cparams.embeddings_nextn_masked &&
+            model.mtp_draft_vocab.compact != nullptr &&
+            layer.nextn.shared_head_head == nullptr) {
+        head_w    = model.mtp_draft_vocab.compact;
+        head_s    = nullptr;
+        head_in_s = nullptr;
+        d2t_eff   = model.mtp_draft_vocab.ids;
+    }
+
     cur = build_lora_mm(head_w, cur, head_s, head_in_s);
     cb(cur, "result_output", -1);
 
-    if (model.d2t) {
-        cur = build_d2t_logits(cur, model.d2t, (int64_t) model.vocab.n_tokens());
+    if (d2t_eff) {
+        cur = build_d2t_logits(cur, d2t_eff, (int64_t) model.vocab.n_tokens());
     }
 
     res->t_logits = cur;

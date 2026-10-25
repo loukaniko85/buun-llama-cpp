@@ -1,6 +1,7 @@
 #pragma once
 
-// Host share of routed MoE misses (GGML_CUDA_MOE_CPU_SHARE=<GPU fraction of misses>, default 0.4).
+// Host share of routed MoE misses (GGML_CUDA_MOE_CPU_SHARE=<GPU fraction of misses> pins it; by default the
+// host takes the share that finishes with the bus, from measured host and bus speed per quant type).
 // A doorbell kernel publishes the layer's routed experts and activations to mapped
 // host memory; host workers compute a share of the missing experts end to end
 // (up/gate, GLU, down) from the host weights while the GPU streams the rest over
