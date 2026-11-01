@@ -2002,7 +2002,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
             (in_s->type == GGML_TYPE_F32 || in_s->type == GGML_TYPE_I32 || in_s->type == GGML_TYPE_I16);
         const bool mxfp4_scale = w->type == GGML_TYPE_MXFP4 && in_s->type == GGML_TYPE_I32;
         const bool exl3_signs = ggml_type_is_exl3(w->type) &&
-            in_s->type == GGML_TYPE_F16 && ggml_nelements(in_s) == w->ne[0];
+            in_s->type == GGML_TYPE_F16 && ggml_nelements(in_s) == w->ne[0]*w->ne[2];
         if (!exl3_signs && ((!fp8_scale && !i8_scale && !i4_scale && !mxfp4_scale) ||
             ggml_nelements(in_s) != 1)) {
             throw std::runtime_error(format(
@@ -2033,7 +2033,7 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const bool w8a16_scale = w->type == GGML_TYPE_I8 && w_s->type == GGML_TYPE_I8 &&
             w_s->ne[0] >= static_cast<int64_t>(sizeof(ggml_w8a16_scale_header));
         const bool exl3_scale = ggml_type_is_exl3(w->type) &&
-            w_s->type == GGML_TYPE_F16 && ggml_nelements(w_s) == w->ne[1];
+            w_s->type == GGML_TYPE_F16 && ggml_nelements(w_s) == w->ne[1]*w->ne[2];
         if ((w->type == GGML_TYPE_F8_E4M3 &&
              (w_s->type == GGML_TYPE_F32 || w_s->type == GGML_TYPE_I8 || fp8_group_scale ||
               is_dynamic_fp8_bf16_channel_scale(w, w_s, in_s))) ||
@@ -2480,7 +2480,7 @@ ggml_tensor * llm_graph_context::build_ffn(
                     const float limit = hparams.swiglu_clamp_shexp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
-                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
+                        if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0)) {
                             cur = ggml_swiglu_clamp(ctx0, cur, tmp, limit);
                         } else {
                             tmp = ggml_clamp(ctx0, tmp, -limit, limit);
@@ -2795,8 +2795,13 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
-        // Avoid division by zero, clamp to smallest number representable by F16
-        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        if (arch == LLM_ARCH_DEEPSEEK41) {
+            // model.py Gate.forward: weights / (sum + 1e-20); the sum can fall below the F16 clamp below
+            weights_sum = ggml_scale_bias(ctx0, weights_sum, 1.0f, 1e-20f);
+        } else {
+            // Avoid division by zero, clamp to smallest number representable by F16
+            weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        }
         cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
 
         weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
@@ -2892,7 +2897,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float limit = hparams.swiglu_clamp_exp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
-                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
+                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_GLM5_NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
                             cur = ggml_swiglu_clamp(ctx0, cur, up, limit);
                         } else {
                             up = ggml_clamp(ctx0, up, -limit, limit);

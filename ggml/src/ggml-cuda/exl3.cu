@@ -558,7 +558,53 @@ void ggml_cuda_exl3_reconstruct_rows(const ggml_tensor * src0, int64_t n0, int64
         int(src0->ne[0]), int(n0), int(n1), stream);
 }
 
+bool ggml_cuda_exl3_supports_mul_mat_batched(const ggml_tensor * dst) {
+    const ggml_tensor * w = dst->src[0];
+    const ggml_tensor * x = dst->src[1];
+    if (w == nullptr || x == nullptr || w->ne[2] == 1) {
+        return ggml_cuda_exl3_supports_mul_mat(dst);
+    }
+    const ggml_tensor * svh = dst->src[2];
+    const ggml_tensor * suh = dst->src[3];
+    const int64_t planes = w->ne[2];
+    // weight planes matched to src1/dst planes; svh [n, planes], suh [k, planes]
+    return ggml_cuda_is_exl3(w->type) && w->ne[0] % 128 == 0 && w->ne[1] % 128 == 0 && w->ne[3] == 1 &&
+        x->type == GGML_TYPE_F32 && ggml_is_contiguous(x) && x->ne[0] == w->ne[0] && x->ne[2] == planes && x->ne[3] == 1 &&
+        dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) && dst->ne[2] == planes &&
+        (svh == nullptr || (svh->type == GGML_TYPE_F16 && ggml_is_contiguous(svh) && ggml_nelements(svh) == w->ne[1]*planes)) &&
+        (suh == nullptr || (suh->type == GGML_TYPE_F16 && ggml_is_contiguous(suh) && ggml_nelements(suh) == w->ne[0]*planes));
+}
+
+static void exl3_mul_mat_plane(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+
 void ggml_cuda_mul_mat_exl3(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (src0->ne[2] == 1) {
+        exl3_mul_mat_plane(ctx, src0, src1, dst);
+        return;
+    }
+    GGML_ASSERT(ggml_cuda_exl3_supports_mul_mat_batched(dst));
+    if (dst->src[2] == nullptr || dst->src[3] == nullptr) {
+        GGML_ABORT("EXL3 MUL_MAT on '%s' is missing its svh/suh sources", src0->name);
+    }
+    // batched MUL_MAT: one 2-D product per weight plane, as the MUL_MAT_ID fallback slices experts
+    for (int64_t i2 = 0; i2 < src0->ne[2]; ++i2) {
+        ggml_tensor w = *src0, x = *src1, y = *dst, svh = *dst->src[2], suh = *dst->src[3];
+        w.ne[2] = x.ne[2] = y.ne[2] = 1;
+        w.data = (char *) src0->data + i2*src0->nb[2];
+        x.data = (char *) src1->data + i2*src1->nb[2];
+        y.data = (char *) dst->data  + i2*dst->nb[2];
+        svh.ne[0] = src0->ne[1]; svh.ne[1] = svh.ne[2] = svh.ne[3] = 1;
+        svh.nb[1] = svh.nb[2] = svh.nb[3] = svh.ne[0]*svh.nb[0];
+        svh.data = (char *) dst->src[2]->data + i2*svh.nb[1];
+        suh.ne[0] = src0->ne[0]; suh.ne[1] = suh.ne[2] = suh.ne[3] = 1;
+        suh.nb[1] = suh.nb[2] = suh.nb[3] = suh.ne[0]*suh.nb[0];
+        suh.data = (char *) dst->src[3]->data + i2*suh.nb[1];
+        y.src[0] = &w; y.src[1] = &x; y.src[2] = &svh; y.src[3] = &suh;
+        exl3_mul_mat_plane(ctx, &w, &x, &y);
+    }
+}
+
+static void exl3_mul_mat_plane(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(ggml_cuda_exl3_supports_mul_mat(dst));
     if (dst->src[2] == nullptr || dst->src[3] == nullptr) {
         GGML_ABORT("EXL3 MUL_MAT on '%s' is missing its svh/suh sources", src0->name);

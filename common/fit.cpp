@@ -713,7 +713,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     }
 
     if (ub_stats) {
-        ub_stats->n_params      = llama_model_n_params(model.get());
+        // row-lookup tables (embeddings, Engram) cost no FLOPs, and Engram alone can outweigh the rest
+        ub_stats->n_params      = llama_model_n_params(model.get()) - llama_model_n_lookup_params(model.get());
         ub_stats->n_expert_used = llama_model_n_expert_used(model.get());
         ub_stats->n_embd        = llama_model_n_embd(model.get());
         ub_stats->host_offload  = llama_model_host_offload_weight_bytes(model.get());

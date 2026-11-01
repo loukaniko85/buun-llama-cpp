@@ -149,6 +149,21 @@ static common_chat_templates_ptr read_templates(const std::string & path) {
     return common_chat_templates_ptr(common_chat_templates_init(/* model= */ nullptr, read_file(path)));
 }
 
+// DeepSeek V4.1 stand-in: the real template ships in the GGUF; this keeps only the turn markers,
+// the generation prompt, the V4.1 DSML block tag used for detection and the extra keys it reads
+static const char * DEEPSEEK_V4_1_MIN_TEMPLATE = R"({%- for m in messages -%}
+{%- if m.role == 'system' -%}<｜System｜>{{ m.content }}
+{%- elif m.role == 'user' -%}<｜User｜>
+{%- if m.content is string -%}{{ m.content }}{%- else -%}{%- for b in m.content -%}{%- if not loop.first -%}{{ '\n\n' }}{%- endif -%}{{ b.text }}{%- endfor -%}{%- endif -%}
+{%- if m.task -%}<｜{{ m.task }}｜>{%- endif -%}
+{%- elif m.role == 'assistant' -%}<｜Assistant｜></think>{{ m.content }}
+{%- for tc in m.tool_calls or [] -%}<｜DSML｜ calls><｜DSML｜ invoke name="{% if tc.namespace %}{{ tc.namespace }}::{% endif %}{{ tc.function.name }}"></｜DSML｜ invoke></｜DSML｜ calls>{%- endfor -%}
+<｜end▁of▁sentence｜>
+{%- endif -%}
+{%- endfor -%}
+{%- if reasoning_effort is defined and reasoning_effort is not none -%}<｜effort={{ reasoning_effort }}｜>{%- endif -%}
+{%- if add_generation_prompt -%}<｜Assistant｜>{%- if enable_thinking -%}<think>{%- else -%}</think>{%- endif -%}{%- endif -%})";
+
 static std::unique_ptr<llama_grammar> build_grammar(const std::string & grammar_str) {
     return std::unique_ptr<llama_grammar>(
         llama_grammar_init_impl(nullptr, grammar_str.c_str(), "root", false, nullptr, 0, nullptr, 0));
@@ -961,6 +976,7 @@ const common_chat_msg message_user{
     /* .reasoning_content = */ "",
     /* .tool_name = */ "",
     /* .tool_call_id = */ "",
+    /* .extra_json = */ "",
 };
 
 const common_chat_msg message_user_parts{
@@ -977,6 +993,7 @@ const common_chat_msg message_user_parts{
     "",
     /* .tool_name = */ "",
     /* .tool_call_id = */ "",
+    /* .extra_json = */ "",
 };
 
 static common_chat_msg simple_assist_msg(const std::string & content,
@@ -1484,6 +1501,11 @@ class peg_tester {
     explicit peg_tester(const std::string & template_path, const bool detailed_debug = false) :
         tmpls_(read_templates(template_path)),
         template_path_(template_path),
+        detailed_debug_(detailed_debug) {}
+
+    peg_tester(const std::string & name, common_chat_templates_ptr tmpls, const bool detailed_debug = false) :
+        tmpls_(std::move(tmpls)),
+        template_path_(name),
         detailed_debug_(detailed_debug) {}
 
     const std::string & template_path() const { return template_path_; }
@@ -4362,6 +4384,103 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             "<｜DSML｜parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜parameter>\n"
             "</｜DSML｜invoke>\n"
             "</｜DSML｜tool_calls>") // no </think> after the TC close because the grammar will immediately constrain it to end
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_time_tool })
+            .expect_reasoning("Let me check the time")
+            .expect_tool_calls({ { "get_time", R"({"city": "Tokyo"})", {} } })
+            .run();
+    }
+
+    // DeepSeek V4.1: V4 behaviour, DSML tag names with a leading space
+    {
+        auto tst = peg_tester("deepseek-v4.1-min",
+                              common_chat_templates_ptr(common_chat_templates_init(nullptr, DEEPSEEK_V4_1_MIN_TEMPLATE)),
+                              detailed_debug);
+
+        tst.test("Hello, world!\nWhat's up?")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist)
+            .run();
+
+        tst.test("I'm\nthinking</think>Hello, world!\nWhat's up?")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .expect(message_assist_thoughts)
+            .run();
+
+        tst.test(
+               "Let me check the time</think>\n\n"
+               "<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_time\">\n"
+               "<｜DSML｜ parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ get_time_tool })
+            .expect(message_with_tool_calls_and_reasoning("get_time", R"({"city": "Tokyo"})", "Let me check the time"))
+            .run();
+
+        tst.test(
+               "<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"special_function\">\n"
+               "<｜DSML｜ parameter name=\"arg1\" string=\"false\">1</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(false)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .tools({ special_function_tool })
+            .expect(message_assist_call)
+            .run();
+
+        tst.test(
+               "Calling both</think>\n\n"
+               "<｜DSML｜ calls>\n"
+               "<｜DSML｜ invoke name=\"get_time\">\n"
+               "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "<｜DSML｜ invoke name=\"get_weather\">\n"
+               "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n"
+               "</｜DSML｜ invoke>\n"
+               "</｜DSML｜ calls>")
+            .enable_thinking(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .parallel_tool_calls(true)
+            .tools({ get_time_tool, get_weather_tool })
+            .expect(message_with_reasoning_content_and_multiple_tool_calls(
+                "Calling both", "",
+                { { "get_time", R"({"city": "Paris"})" }, { "get_weather", R"({"city": "Paris"})" } }))
+            .run();
+
+        tst.test("world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .enable_thinking(true)
+            .messages({ message_user, message_assist_prefill_content })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_CONTENT)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        tst.test(" thinking</think>Hello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
+            .enable_thinking(true)
+            .messages({ message_user, message_assist_prefill_reasoning })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_REASONING)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        tst.test(
+            "Let me check the time\n\n"
+            "<｜DSML｜ calls>\n"
+            "<｜DSML｜ invoke name=\"get_time\">\n"
+            "<｜DSML｜ parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜ parameter>\n"
+            "</｜DSML｜ invoke>\n"
+            "</｜DSML｜ calls>") // no </think> after the TC close because the grammar will immediately constrain it to end
             .enable_thinking(true)
             .reasoning_format(COMMON_REASONING_FORMAT_DEEPSEEK)
             .tools({ get_time_tool })

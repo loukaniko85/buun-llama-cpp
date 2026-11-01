@@ -252,6 +252,47 @@ int32_t common_cpu_get_num_moe_threads() {
     return common_cpu_resolve_moe_threads(common_cpu_get_num_physical_cores());
 }
 
+int32_t common_cpu_get_num_numa_nodes() {
+#if defined(__linux__)
+    // count the nodes holding a CPU this process may run on, so numactl/cpuset binds count as one node
+    cpu_set_t affinity;
+    if (sched_getaffinity(0, sizeof(affinity), &affinity) != 0) {
+        return 1;
+    }
+    int32_t n_nodes = 0;
+    for (int node = 0; ; ++node) {
+        const std::string dir = "/sys/devices/system/node/node" + std::to_string(node);
+        if (!std::filesystem::is_directory(dir)) {
+            break;
+        }
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (CPU_ISSET(cpu, &affinity) && std::filesystem::exists(dir + "/cpu" + std::to_string(cpu))) {
+                ++n_nodes;
+                break;
+            }
+        }
+    }
+    return std::max<int32_t>(n_nodes, 1);
+#else
+    return 1;
+#endif
+}
+
+ggml_numa_strategy common_numa_auto_strategy() {
+    return common_cpu_get_num_numa_nodes() > 1 ? GGML_NUMA_STRATEGY_EXPERTS : GGML_NUMA_STRATEGY_DISABLED;
+}
+
+bool common_numa_strategy_from_str(const std::string & value, ggml_numa_strategy & numa) {
+    /**/ if (value == "auto") { numa = common_numa_auto_strategy(); }
+    else if (value == "disabled") { numa = GGML_NUMA_STRATEGY_DISABLED; }
+    else if (value == "distribute" || value == "") { numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
+    else if (value == "isolate") { numa = GGML_NUMA_STRATEGY_ISOLATE; }
+    else if (value == "numactl") { numa = GGML_NUMA_STRATEGY_NUMACTL; }
+    else if (value == "experts") { numa = GGML_NUMA_STRATEGY_EXPERTS; }
+    else { return false; }
+    return true;
+}
+
 // Helper for setting process priority
 
 #if defined(_WIN32)
@@ -1474,7 +1515,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 ? (uint32_t) params.speculative.draft.n_ctx : 0,
             /*.next         =*/ spec_mtp && !extra_is_mtp ? &extra_mtp : nullptr,
             /*.optional_if_no_mtp =*/ false,
-            /*.borrows_target_tensors =*/ has_draft && extra_is_mtp,
+            // EAGLE3/DFlash/DSpark sidecars may omit the embedding and output and need the target to build a context
+            /*.borrows_target_tensors =*/ has_draft && (extra_is_mtp || params.speculative.has_target_feature_drafter()),
             /*.target_n_rs_seq_tensor =*/ params.speculative.need_n_rs_seq_tensor(),
         };
 

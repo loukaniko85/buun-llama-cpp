@@ -204,6 +204,7 @@ typedef void * thread_ret_t;
 #include <sys/stat.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 
 #endif
 
@@ -790,7 +791,7 @@ bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
 }
 
-static bool ggml_numa_experts(void) {
+bool ggml_numa_experts(void) {
     return g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_EXPERTS && ggml_is_numa();
 }
 
@@ -881,6 +882,27 @@ static void * ggml_numa_place_thread(void * data) {
     free(buf);
     return NULL;
 }
+
+// fraction of [offset, offset + size) of fd held in the page cache, or -1 if unknown
+static double ggml_numa_cached_fraction(int fd, size_t offset, size_t size) {
+    const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
+    const size_t beg = offset & ~(page_size - 1);
+    const size_t len = ((offset + size + page_size - 1) & ~(page_size - 1)) - beg;
+    void * map = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, (off_t) beg);
+    if (map == MAP_FAILED) {
+        return -1.0;
+    }
+    const size_t n_pages = len / page_size;
+    unsigned char * vec = malloc(n_pages);
+    size_t n_cached = 0;
+    const bool ok = vec != NULL && mincore(map, len, vec) == 0;
+    for (size_t i = 0; ok && i < n_pages; ++i) {
+        n_cached += vec[i] & 1;
+    }
+    free(vec);
+    munmap(map, len);
+    return ok ? (double) n_cached / (double) n_pages : -1.0;
+}
 #endif
 
 bool ggml_numa_place_experts(int fd, size_t offset, size_t row_size, int64_t n_rows, int64_t n_expert) {
@@ -889,6 +911,18 @@ bool ggml_numa_place_experts(int fd, size_t offset, size_t row_size, int64_t n_r
         return false;
     }
 #if defined(__gnu_linux__)
+    // Placement can only home a cached page by dropping and re-reading it (moving it needs
+    // move_pages, which containers usually deny), so it runs on cold experts only. A warm cache
+    // most often comes from an earlier placed load, and re-reading it from disk costs far more
+    // load time than misplaced pages cost decode.
+    if (ggml_numa_cached_fraction(fd, offset, expert_size * n_expert) >= 0.5) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            GGML_LOG_INFO("%s: experts already page-cached, keeping their pages where they are (drop the page cache to re-place them)\n", __func__);
+        }
+        return false;
+    }
     // A private open file description, so its readahead state is ours: readahead past an
     // expert's end would first-touch the next expert's pages from the wrong node.
     char path[64];

@@ -540,7 +540,7 @@ static const cmd_params cmd_params_defaults = {
     /* vbr_entry_explicit   */ false,
     /* vbr_floor_explicit   */ false,
     /* vbr_vram_explicit    */ false,
-    /* numa                 */ GGML_NUMA_STRATEGY_DISABLED,
+    /* numa                 */ common_numa_auto_strategy(),
     /* reps                 */ 5,
     /* prio                 */ GGML_SCHED_PRIO_NORMAL,
     /* delay                */ 0,
@@ -562,7 +562,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("options:\n");
     printf("  -h, --help\n");
     printf("  --version                                   show version and build info\n");
-    printf("  --numa <distribute|isolate|numactl>         numa mode (default: disabled)\n");
+    printf("  --numa <auto|disabled|experts|distribute|isolate|numactl>\n");
+    printf("                                              numa mode (default: auto = experts on a multi-node host)\n");
     printf("  -r, --repetitions <n>                       number of times to repeat each test (default: %d)\n", cmd_params_defaults.reps);
     printf("  --prio <-1|0|1|2|3>                         process/thread priority (default: %d)\n", cmd_params_defaults.prio);
     printf("  --delay <0...N> (seconds)                   delay between each test (default: %d)\n", cmd_params_defaults.delay);
@@ -1147,13 +1148,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 std::string value(argv[i]);
-                if (value == "distribute" || value == "") {
-                    params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE;
-                } else if (value == "isolate") {
-                    params.numa = GGML_NUMA_STRATEGY_ISOLATE;
-                } else if (value == "numactl") {
-                    params.numa = GGML_NUMA_STRATEGY_NUMACTL;
-                } else {
+                if (!common_numa_strategy_from_str(value, params.numa)) {
                     invalid_param = true;
                     break;
                 }

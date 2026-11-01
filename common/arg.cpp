@@ -1682,6 +1682,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         params.no_extra_bufts = true;
     }
 
+    if (params.numa_auto) {
+        params.numa = common_numa_auto_strategy();
+        if (params.numa == GGML_NUMA_STRATEGY_EXPERTS) {
+            LOG_INF("usable CPUs span more than one NUMA node: using --numa experts (--numa disabled turns it off)\n");
+        }
+    }
+
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
@@ -3784,6 +3791,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
+        "- auto: experts when the usable CPUs span more than one node, otherwise disabled (default)\n"
+        "- disabled: no NUMA handling\n"
         "- distribute: spread execution evenly over all nodes\n"
         "- isolate: only spawn threads on CPUs on the node that execution started on\n"
         "- numactl: use the CPU map provided by numactl\n"
@@ -3792,11 +3801,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "if run without this previously, it is recommended to drop the system page cache before using this\n"
         "see https://github.com/ggml-org/llama.cpp/issues/1437",
         [](common_params & params, const std::string & value) {
-            /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
-            else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
-            else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
-            else if (value == "experts") { params.numa = GGML_NUMA_STRATEGY_EXPERTS; }
-            else { throw std::invalid_argument("invalid value"); }
+            // auto resolves after parsing, so the log line below names the choice
+            params.numa_auto = value == "auto";
+            if (!params.numa_auto && !common_numa_strategy_from_str(value, params.numa)) {
+                throw std::invalid_argument("invalid value");
+            }
         }
     ).set_env("LLAMA_ARG_NUMA"));
     add_opt(common_arg(

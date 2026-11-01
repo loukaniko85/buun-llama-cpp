@@ -169,6 +169,10 @@ LLAMA_API enum llama_split_mode llama_model_split_mode(const struct llama_model 
 // So are MTP blocks, which only the draft context runs.
 LLAMA_API size_t llama_model_host_offload_weight_bytes(const struct llama_model * model);
 
+// Elements of the token embedding tables (incl. per-layer / Engram tables), which a token reads
+// by row lookup rather than multiplying, so they add no per-token FLOPs.
+LLAMA_API uint64_t llama_model_n_lookup_params(const struct llama_model * model);
+
 // The largest 2D block weight (routed experts and the embedding/output matrices aside), the
 // matmul that dominates a dense prefill. Returns false when the model has none.
 LLAMA_API bool llama_model_largest_block_weight(

@@ -37,6 +37,7 @@ extern "C" {
 
     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
+    GGML_BACKEND_API bool    ggml_numa_experts(void); // true if GGML_NUMA_STRATEGY_EXPERTS is active on a NUMA system
     // GGML_NUMA_STRATEGY_EXPERTS: re-read the n_expert contiguous experts of n_rows rows of row_size bytes
     // at offset of file fd into the page cache, row part k of each from threads pinned to node k.
     // Returns false if not applied.

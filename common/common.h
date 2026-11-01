@@ -87,6 +87,11 @@ int32_t common_cpu_get_num_physical_cores();
 int32_t common_cpu_get_num_math();
 int32_t common_cpu_resolve_moe_threads(int32_t physical_cores);
 int32_t common_cpu_get_num_moe_threads();
+int32_t common_cpu_get_num_numa_nodes();
+// --numa auto: experts on a host whose usable CPUs span more than one NUMA node, else disabled
+ggml_numa_strategy common_numa_auto_strategy();
+// parse a --numa value ("auto" resolves via common_numa_auto_strategy); false if unknown
+bool common_numa_strategy_from_str(const std::string & value, ggml_numa_strategy & numa);
 
 //
 // Common params
@@ -455,8 +460,12 @@ struct common_params_speculative {
     }
 
     bool has_non_mtp_model_drafter() const {
-        return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) ||
-               has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) ||
+        return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) || has_target_feature_drafter();
+    }
+
+    // EAGLE3/DFlash/DSpark sidecars read the target's hidden states and may borrow its embedding/output
+    bool has_target_feature_drafter() const {
+        return has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) ||
                has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
                has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) ||
                has_type(COMMON_SPECULATIVE_TYPE_DFLASH);
@@ -664,6 +673,7 @@ struct common_params {
     void * cb_eval_user_data                 = nullptr;
 
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
+    bool numa_auto = true; // resolve numa from the host topology after parsing (--numa auto)
 
     enum llama_rope_scaling_type rope_scaling_type = LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings

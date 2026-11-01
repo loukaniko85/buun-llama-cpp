@@ -1,5 +1,6 @@
 #include "llama-safetensors-deepseek4.h"
 
+#include "llama-impl.h"
 #include "llama-safetensors-templates.h"
 #include "llama-safetensors-metadata.h"
 #include "llama-safetensors-names.h"
@@ -26,6 +27,7 @@ enum class target_kind {
     HASH_TABLE,
     EH_WEIGHT,
     EH_SCALE,
+    STACK,
 };
 
 struct target_spec {
@@ -34,6 +36,9 @@ struct target_spec {
     std::optional<llama_safetensors_quant_binding> quant;
     uint32_t layer = 0;
     char expert_projection = 0;
+    // STACK: same-shape bindings concatenated along a new outer dimension
+    // (EXL3 wo_a group slices, per-expert EXL3 svh/suh vectors)
+    std::vector<llama_safetensors_quant_binding> stack;
 };
 
 const llama_safetensors_tensor & require_tensor(
@@ -57,10 +62,12 @@ std::vector<int64_t> reverse_shape(const llama_safetensors_tensor & tensor) {
     return result;
 }
 
+// Rank-1 half-precision vectors (norms, the router bias) are promoted to F32 as the GGUF converter
+// does: the graph adds them to F32 activations, which CUDA bin ops and fused top-k only take as F32.
 ggml_type plain_type(const llama_safetensors_tensor & tensor) {
     switch (tensor.dtype) {
-        case llama_safetensors_dtype::BF16: return GGML_TYPE_BF16;
-        case llama_safetensors_dtype::F16:  return GGML_TYPE_F16;
+        case llama_safetensors_dtype::BF16: return tensor.shape.size() >= 2 ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+        case llama_safetensors_dtype::F16:  return tensor.shape.size() >= 2 ? GGML_TYPE_F16 : GGML_TYPE_F32;
         case llama_safetensors_dtype::F32:  return GGML_TYPE_F32;
         case llama_safetensors_dtype::I32:  return GGML_TYPE_I32;
         default:
@@ -86,15 +93,47 @@ target_spec projection(
     return result;
 }
 
+// EXL3 input signs exist only for quantized projections; no plain fallback source
+target_spec input_scale(const llama_safetensors_quant_adapters & quant, const std::string & module) {
+    target_spec result;
+    result.quant = bind_quant(quant, module, llama_safetensors_quant_role::INPUT_SCALE);
+    if (result.quant) result.source = result.quant->primary;
+    return result;
+}
+
+// exllamav3 stores the grouped wo_a as one EXL3 tensor per group ("wo_a.slice.N")
+target_spec slice_stack(
+        const llama_safetensors_quant_adapters & quant,
+        const llama_safetensors_registry & registry,
+        const std::string & module,
+        llama_safetensors_quant_role role) {
+    target_spec result;
+    for (uint32_t slice = 0;; ++slice) {
+        const std::string name = module + ".slice." + std::to_string(slice);
+        if (registry.find(name + ".trellis") == nullptr) break;
+        auto binding = bind_quant(quant, name, role);
+        if (!binding) throw std::runtime_error("missing DeepSeek-V4 EXL3 slice binding for '" + name + "'");
+        result.stack.push_back(std::move(*binding));
+    }
+    if (!result.stack.empty()) {
+        result.kind = target_kind::STACK;
+        result.source = result.stack.front().primary;
+    }
+    return result;
+}
+
 target_spec map_target(
         const llama_safetensors_quant_adapters & quant,
+        const llama_safetensors_registry & registry,
         uint32_t n_layer,
         uint32_t n_mtp,
+        uint32_t n_expert,
         const std::string & target) {
     if (target == "token_embd.weight") return { target_kind::TENSOR, "embed.weight" };
     if (target == "output_norm.weight") return { target_kind::TENSOR, "norm.weight" };
     if (target == "output.weight") return projection(quant, "head");
     if (target == "output.scale") return projection(quant, "head", llama_safetensors_quant_role::WEIGHT_SCALE);
+    if (target == "output.input_scale") return input_scale(quant, "head");
     if (target == "output_hc_fn.weight") return { target_kind::TENSOR, "hc_head_fn" };
     if (target == "output_hc_base.weight") return { target_kind::TENSOR, "hc_head_base" };
     if (target == "output_hc_scale.weight") return { target_kind::TENSOR, "hc_head_scale" };
@@ -164,23 +203,53 @@ target_spec map_target(
         { "ffn_up_shexp.weight",          "ffn.shared_experts.w3",              true  },
         { "ffn_up_shexp.scale",           "ffn.shared_experts.w3",              true  },
     };
+    static const std::string input_suffix = ".input_scale";
+    const bool input = suffix.size() > input_suffix.size() &&
+        suffix.compare(suffix.size() - input_suffix.size(), input_suffix.size(), input_suffix) == 0;
+    const std::string weight_suffix = input ? suffix.substr(0, suffix.size() - input_suffix.size()) + ".weight" : suffix;
     for (const mapping & item : mappings) {
-        if (suffix != item.target) continue;
+        if (weight_suffix != item.target) continue;
         const std::string source = prefix + item.source;
-        if (!item.projected) return { target_kind::TENSOR, source };
+        if (!item.projected) return input ? target_spec{} : target_spec{ target_kind::TENSOR, source };
         const bool scale = suffix.size() >= 6 && suffix.compare(suffix.size() - 6, 6, ".scale") == 0;
-        return projection(quant, source, scale ? llama_safetensors_quant_role::WEIGHT_SCALE :
-            llama_safetensors_quant_role::WEIGHT);
+        const auto role = input ? llama_safetensors_quant_role::INPUT_SCALE :
+            scale ? llama_safetensors_quant_role::WEIGHT_SCALE : llama_safetensors_quant_role::WEIGHT;
+        if (registry.find(source + ".slice.0.trellis") != nullptr) return slice_stack(quant, registry, source, role);
+        return input ? input_scale(quant, source) : projection(quant, source, role);
     }
 
     if (suffix == "ffn_gate_tid2eid.weight") return { target_kind::HASH_TABLE, prefix + "ffn.gate.tid2eid" };
-    if (suffix == "ffn_gate_exps.weight" || suffix == "ffn_down_exps.weight" || suffix == "ffn_up_exps.weight") {
+    static constexpr const char * expert_targets[] = { "ffn_gate_exps", "ffn_down_exps", "ffn_up_exps" };
+    for (size_t projection_index = 0; projection_index < 3; ++projection_index) {
+        const std::string base = expert_targets[projection_index];
+        const char expert_projection = char('1' + projection_index);
+        if (suffix == base + ".weight") {
+            target_spec result;
+            result.kind = target_kind::EXPERTS;
+            result.source = prefix;
+            result.layer = layer;
+            result.expert_projection = expert_projection;
+            return result;
+        }
+        if (suffix != base + ".scale" && suffix != base + input_suffix) continue;
+        // EXL3 experts: per-expert svh / suh vectors stack to [n, n_expert] / [k, n_expert]
+        const auto role = suffix == base + ".scale" ? llama_safetensors_quant_role::WEIGHT_SCALE :
+            llama_safetensors_quant_role::INPUT_SCALE;
+        const auto module_of = [&](uint32_t expert) {
+            return prefix + "ffn.experts." + std::to_string(expert) + ".w" + expert_projection;
+        };
+        // expert 0 stands for the bank, as in describe()
+        const auto weight = bind_quant(quant, module_of(0), llama_safetensors_quant_role::WEIGHT);
+        if (!weight || !ggml_type_is_exl3(weight->target_type)) return {};
         target_spec result;
-        result.kind = target_kind::EXPERTS;
-        result.source = prefix;
-        result.layer = layer;
-        result.expert_projection = suffix == "ffn_gate_exps.weight" ? '1' :
-            suffix == "ffn_down_exps.weight" ? '2' : '3';
+        for (uint32_t expert = 0; expert < n_expert; ++expert) {
+            const std::string module = module_of(expert);
+            auto side = bind_quant(quant, module, role);
+            if (!side) throw std::runtime_error("missing DeepSeek-V4 EXL3 expert side vector for '" + module + "'");
+            result.stack.push_back(std::move(*side));
+        }
+        result.kind = target_kind::STACK;
+        result.source = result.stack.front().primary;
         return result;
     }
     return {};
@@ -188,6 +257,10 @@ target_spec map_target(
 
 std::string expert_module(const target_spec & spec, uint32_t expert) {
     return spec.source + "ffn.experts." + std::to_string(expert) + ".w" + spec.expert_projection;
+}
+
+bool expert_type_supported(ggml_type type) {
+    return type == GGML_TYPE_MXFP4 || ggml_type_is_exl3(type);
 }
 
 std::vector<uint8_t> concat_rows(
@@ -240,6 +313,11 @@ llama_safetensors_deepseek4_importer::llama_safetensors_deepseek4_importer(
     registry_ = llama_safetensors_registry::load(model_dir_, io_mode);
     quant_ = std::make_unique<llama_safetensors_quant_adapters>(config_, registry_);
     if (n_mtp_ != 0 && registry_.find("mtp.0.attn_norm.weight") == nullptr) n_mtp_ = 0;
+    // exllamav3 0731 ships a DSpark block drafter (main_proj over target layers) instead of NextN e/h_proj
+    if (n_mtp_ != 0 && registry_.find("mtp.0.e_proj.weight") == nullptr && registry_.find("mtp.0.e_proj.trellis") == nullptr) {
+        LLAMA_LOG_WARN("%s: DeepSeek-V4 MTP block is not NextN (DSpark drafter?); loading without MTP\n", __func__);
+        n_mtp_ = 0;
+    }
 }
 
 bool llama_safetensors_deepseek4_importer::probe(const llama_safetensors_json & config) {
@@ -315,14 +393,22 @@ gguf_context * llama_safetensors_deepseek4_importer::build_metadata() const {
 bool llama_safetensors_deepseek4_importer::describe(
         const std::string & target, ggml_type & type,
         std::array<int64_t, GGML_MAX_DIMS> & ne) const {
-    const target_spec spec = map_target(*quant_, n_layer_, n_mtp_, target);
+    const target_spec spec = map_target(*quant_, registry_, n_layer_, n_mtp_, n_expert_, target);
     std::vector<int64_t> shape;
     if (spec.kind == target_kind::EXPERTS) {
         const auto binding = quant_->bind(expert_module(spec, 0), llama_safetensors_quant_role::WEIGHT);
-        if (!binding || binding->target_type != GGML_TYPE_MXFP4 || binding->target_shape.size() != 2) return false;
-        type = GGML_TYPE_MXFP4;
+        if (!binding || !expert_type_supported(binding->target_type) || binding->target_shape.size() != 2) return false;
+        type = binding->target_type;
         shape = binding->target_shape;
         shape.push_back(n_expert_);
+    } else if (spec.kind == target_kind::STACK) {
+        const auto & first = spec.stack.front();
+        for (const auto & binding : spec.stack) {
+            if (binding.target_type != first.target_type || binding.target_shape != first.target_shape) return false;
+        }
+        type = first.target_type;
+        shape = first.target_shape;
+        shape.push_back(static_cast<int64_t>(spec.stack.size()));
     } else if (spec.kind == target_kind::HASH_TABLE) {
         const auto * source = registry_.find(spec.source);
         if (source == nullptr) return false;
@@ -355,7 +441,7 @@ size_t llama_safetensors_deepseek4_importer::tensor_capacity_hint() const {
 }
 
 void llama_safetensors_deepseek4_importer::bind(const std::string & target) const {
-    const target_spec spec = map_target(*quant_, n_layer_, n_mtp_, target);
+    const target_spec spec = map_target(*quant_, registry_, n_layer_, n_mtp_, n_expert_, target);
     if (spec.kind == target_kind::EXPERTS) {
         for (uint32_t expert = 0; expert < n_expert_; ++expert) {
             const auto binding = quant_->bind(expert_module(spec, expert), llama_safetensors_quant_role::WEIGHT);
@@ -369,6 +455,8 @@ void llama_safetensors_deepseek4_importer::bind(const std::string & target) cons
         const auto h = quant_->bind(spec.source + "h_proj", role);
         if (!e || !h) throw std::runtime_error("missing DeepSeek-V4 MTP projection quantization binding");
         quant_->consume(*e); quant_->consume(*h);
+    } else if (spec.kind == target_kind::STACK) {
+        for (const auto & binding : spec.stack) quant_->consume(binding);
     } else if (spec.quant) {
         quant_->consume(*spec.quant);
     }
@@ -376,7 +464,7 @@ void llama_safetensors_deepseek4_importer::bind(const std::string & target) cons
 
 bool llama_safetensors_deepseek4_importer::load(
         const std::string & target, ggml_tensor * destination, bool check_tensor) const {
-    const target_spec spec = map_target(*quant_, n_layer_, n_mtp_, target);
+    const target_spec spec = map_target(*quant_, registry_, n_layer_, n_mtp_, n_expert_, target);
     if (spec.kind == target_kind::EXPERTS) {
         const size_t plane = ggml_nbytes(destination) / n_expert_;
         if (plane * n_expert_ != ggml_nbytes(destination)) throw std::runtime_error("invalid DeepSeek-V4 expert destination");
@@ -385,7 +473,8 @@ bool llama_safetensors_deepseek4_importer::load(
             if (!binding) throw std::runtime_error("missing DeepSeek-V4 expert binding during upload");
             auto bytes = quant_->finalize(*binding, quant_->read(*binding));
             if (bytes.size() != plane) throw std::runtime_error("DeepSeek-V4 expert plane has the wrong byte size");
-            if (check_tensor && !ggml_validate_row_data(GGML_TYPE_MXFP4, bytes.data(), bytes.size()))
+            if (check_tensor && binding->target_type == GGML_TYPE_MXFP4 &&
+                !ggml_validate_row_data(GGML_TYPE_MXFP4, bytes.data(), bytes.size()))
                 throw std::runtime_error("DeepSeek-V4 expert contains invalid MXFP4 data");
             return bytes;
         };
@@ -452,7 +541,7 @@ bool llama_safetensors_deepseek4_importer::load(
 std::vector<uint8_t> llama_safetensors_deepseek4_importer::materialize(
         const std::string & target, ggml_type target_type, size_t target_size) const {
     try {
-        const target_spec spec = map_target(*quant_, n_layer_, n_mtp_, target);
+        const target_spec spec = map_target(*quant_, registry_, n_layer_, n_mtp_, n_expert_, target);
         std::vector<uint8_t> result;
         if (spec.kind == target_kind::HASH_TABLE) {
             const auto & source = require_tensor(registry_, spec.source);
@@ -483,8 +572,13 @@ std::vector<uint8_t> llama_safetensors_deepseek4_importer::materialize(
                 result.insert(result.end(), hb.begin(), hb.end());
             }
         } else if (spec.kind == target_kind::TENSOR) {
-            const auto & source = require_tensor(registry_, spec.source);
-            result = spec.quant ? quant_->finalize(*spec.quant, quant_->read(*spec.quant)) : registry_.read(source);
+            return llama_safetensors_materialize_tensor(registry_, *quant_, { spec.source, spec.quant }, target_type, target_size);
+        } else if (spec.kind == target_kind::STACK) {
+            result.reserve(target_size);
+            for (const auto & binding : spec.stack) {
+                const auto bytes = quant_->finalize(binding, quant_->read(binding));
+                result.insert(result.end(), bytes.begin(), bytes.end());
+            }
         } else {
             throw std::runtime_error("DeepSeek-V4 routed experts must use bounded upload");
         }

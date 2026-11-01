@@ -20,6 +20,8 @@ static inline int ggml_cuda_exl3_codebook(ggml_type type) {
 }
 
 bool ggml_cuda_exl3_supports_mul_mat(const ggml_tensor * dst);
+// Also admits a batched MUL_MAT: w [k, n, planes] against src1/dst planes, svh [n, planes], suh [k, planes].
+bool ggml_cuda_exl3_supports_mul_mat_batched(const ggml_tensor * dst);
 
 // Only admit the measured Turing image: older PTX may have no tiled GEMM body.
 static inline bool ggml_cuda_exl3_turing_gemm_supported(int cc, int compiled_cc, int m, int n, int k) {

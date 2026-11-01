@@ -423,8 +423,10 @@ static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_b
 }
 
 static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    const bool layout_op = op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW ||
+        op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE;
     // Tiled EXL3 has a matrix executor, not a standalone row dequantizer.
-    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+    for (int i = 0; i < GGML_MAX_SRC && !layout_op; ++i) {
         if (op->src[i] != nullptr && ggml_type_is_exl3(op->src[i]->type)) {
             return ggml_cpu_exl3_supports(op);
         }
@@ -432,7 +434,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
-    if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
+    if (layout_op) {
         return true;
     }
 
@@ -786,6 +788,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     }
     if (strcmp(name, "ggml_backend_cpu_is_numa") == 0) {
         return (void *)ggml_is_numa;
+    }
+    if (strcmp(name, "ggml_backend_cpu_numa_experts") == 0) {
+        return (void *)ggml_numa_experts;
     }
     if (strcmp(name, "ggml_backend_cpu_numa_place_experts") == 0) {
         return (void *)ggml_numa_place_experts;

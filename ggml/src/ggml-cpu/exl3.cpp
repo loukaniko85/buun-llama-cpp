@@ -15,7 +15,7 @@ constexpr int cache_max_rows = 64;
 // Share input transforms across output tiles for decode/small batches without
 // making large prefill workspaces grow with (tokens * selected experts * K).
 int64_t shared_rows(const ggml_tensor * dst) {
-    const int64_t rows = dst->op == GGML_OP_MUL_MAT_ID ? ggml_nelements(dst->src[2]) : dst->src[1]->ne[1];
+    const int64_t rows = dst->op == GGML_OP_MUL_MAT_ID ? ggml_nelements(dst->src[2]) : dst->src[1]->ne[1]*dst->src[1]->ne[2];
     return rows <= cache_max_rows ? rows : 0;
 }
 
@@ -181,7 +181,7 @@ bool ggml_cpu_exl3_supports(const ggml_tensor * dst) {
         if (!ids || ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) ||
             ids->ne[2] != 1 || ids->ne[3] != 1 || x->ne[2] != ids->ne[1] ||
             x->ne[1] < 1 || ids->ne[0] % x->ne[1] != 0) return false;
-    } else if (w->ne[2] != 1 || x->ne[2] != 1) {
+    } else if (x->ne[2] != w->ne[2]) {
         return false;
     }
     // Loader placement probes precede attachment of the scale/sign tensors.
@@ -211,7 +211,7 @@ void ggml_cpu_exl3_compute(const ggml_compute_params * params, ggml_tensor * dst
     GGML_ASSERT(svh && suh);
     const int64_t k = w->ne[0], n = w->ne[1];
     const int64_t topk = grouped ? ids->ne[0] : 1;
-    const int64_t tokens = grouped ? ids->ne[1] : x->ne[1];
+    const int64_t tokens = grouped ? ids->ne[1] : x->ne[1]*x->ne[2];
     const int bits = ggml_exl3_bits(w->type);
     const auto dot = dot_kernels[bits-1];
     const float * lut = codebook(ggml_exl3_codebook(w->type));
@@ -219,8 +219,9 @@ void ggml_cpu_exl3_compute(const ggml_compute_params * params, ggml_tensor * dst
     float * transformed = static_cast<float *>(params->wdata);
     float * xh = shared ? nullptr : transformed + params->ith*k;
 
+    // a batched MUL_MAT (weight planes matched to src1 planes) runs plane-major like an expert bank
     auto expert_at = [&](int64_t row) {
-        int32_t expert = 0;
+        int32_t expert = int32_t(row / x->ne[1]);
         if (grouped) {
             std::memcpy(&expert, static_cast<const char *>(ids->data) +
                 (row/topk)*ids->nb[1] + (row%topk)*ids->nb[0], sizeof(expert));
@@ -232,7 +233,8 @@ void ggml_cpu_exl3_compute(const ggml_compute_params * params, ggml_tensor * dst
     auto prepare = [&](int64_t row, float * transformed) {
         const int expert = expert_at(row);
         const auto * signs = reinterpret_cast<const ggml_fp16_t *>(static_cast<const char *>(suh->data) + expert*suh->nb[1]);
-        const size_t offset = grouped ? (row/topk)*x->nb[2] + (row%topk % x->ne[1])*x->nb[1] : row*x->nb[1];
+        const size_t offset = grouped ? (row/topk)*x->nb[2] + (row%topk % x->ne[1])*x->nb[1] :
+            (row / x->ne[1])*x->nb[2] + (row % x->ne[1])*x->nb[1];
         const auto * input = reinterpret_cast<const float *>(static_cast<const char *>(x->data) + offset);
         for (int64_t i = 0; i < k; ++i) transformed[i] = input[i]*GGML_FP16_TO_FP32(signs[i]);
         for (int64_t i = 0; i < k; i += had_size) had128(transformed+i);
