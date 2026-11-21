@@ -289,7 +289,7 @@ static const char * cu_get_error_str(CUresult err) {
             static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = { false };                         \
             const int   id                                                = ggml_cuda_get_device();            \
             if (!shared_memory_limit_raised[id]) {                                                             \
-                CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes)); \
+                ggml_cuda_set_max_dynamic_smem(kernel, nbytes);                                                \
                 shared_memory_limit_raised[id] = true;                                                         \
             }                                                                                                  \
         } while (0)
@@ -1319,6 +1319,15 @@ void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 cudaError_t ggml_cuda_device_memory_info(int device, size_t * free, size_t * total);
 
+// cudaFuncSetAttribute(MaxDynamicSharedMemorySize) on the current device. The first call lazily loads
+// the kernel's module, which needs device memory: on OOM, surrender MoE cache storage and retry.
+void ggml_cuda_set_max_dynamic_smem_impl(const void * kernel, int nbytes);
+
+template <typename K>
+static void ggml_cuda_set_max_dynamic_smem(K kernel, int nbytes) {
+    ggml_cuda_set_max_dynamic_smem_impl(reinterpret_cast<const void *>(kernel), nbytes);
+}
+
 struct ggml_cuda_pool_alloc_failure : std::exception {
     const char * what() const noexcept override {
         return "ggml-cuda pool allocation failed: out of VRAM";
@@ -1445,6 +1454,9 @@ struct ggml_cuda_graph {
 
     // owning backend context's fattn scratch-allocation epoch at last capture
     unsigned long long fattn_scratch_epoch_at_capture = 0;
+
+    // the last evaluation waited on a deferred input (see ggml_backend_cuda_context::deferred_input)
+    bool deferred_input_wait = false;
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
@@ -1740,6 +1752,11 @@ struct ggml_backend_cuda_context {
     // set while the meta backend records a whole tensor-parallel step on this context's stream:
     // graph_compute then launches plainly into that capture (no per-graph CUDA graph, no upload wait)
     bool external_capture = false;
+
+    // A split input uploaded on a side stream: the next graph waits on the event right before the
+    // input's first consumer, so earlier independent nodes overlap the upload.
+    const ggml_tensor * deferred_input = nullptr;
+    cudaEvent_t deferred_input_event = nullptr;
 
     // Persistent flash-attention scratch belongs to this backend context, not to the process or
     // physical device. Independent llama contexts therefore never alias Q/K/V work buffers.

@@ -830,6 +830,12 @@ void dequantize_row_f8_e4m3(const uint8_t * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+void dequantize_row_f8_e8m0(const uint8_t * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    for (int64_t i = 0; i < k; ++i) {
+        y[i] = ggml_e8m0_to_fp32(x[i]);
+    }
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -5822,6 +5828,15 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 for (size_t i = 0; i < nb; ++i) {
                     if ((f8[i] & 0x7f) == 0x7f) {
                         fprintf(stderr, "%s: found NaN at element %zu of E4M3 row\n", __func__, i);
+                        return false;
+                    }
+                }
+            } break;
+        case GGML_TYPE_F8_E8M0:
+            {
+                const uint8_t * e8 = (const uint8_t *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_e_e8m0(e8[i], i)) {
                         return false;
                     }
                 }

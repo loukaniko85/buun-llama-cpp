@@ -2,6 +2,7 @@
 #include "ggml-cpu-impl.h"
 #include "../ggml-backend-moe-cache.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <new>
@@ -11,6 +12,7 @@ namespace {
 constexpr int had_size = 128;
 constexpr float had_scale = 0.088388347648f;
 constexpr int cache_max_rows = 64;
+constexpr int tile_rows = 4; // activation rows sharing one decoded tile
 
 // Share input transforms across output tiles for decode/small batches without
 // making large prefill workspaces grow with (tokens * selected experts * K).
@@ -87,26 +89,35 @@ uint16_t window(const uint8_t * tile, int element) {
     return uint16_t(((uint64_t(a) << 32) | b) >> (48-pos%32));
 }
 
-#if defined(__AVX2__) && defined(__FMA__)
-// Eight output columns at a time, retaining the scalar K accumulation order.
-// Window locations depend only on bit width and the 16x16 tile permutation.
+// Position of (row r, column c) of a 16x16 tile in its bitstream.
+constexpr int tile_element(int r, int c) {
+    return ((c%8)*4+(r%8)/2)*8 + r%2 + (r/8)*2 + (c/8)*4;
+}
+
+// Window locations depend only on bit width and the 16x16 tile permutation:
+// state = (word a >> ar | word a << al | word b >> br) & 0xffff.
 template<int bits>
 struct window_indices {
-    int a[2][16][8], b[2][16][8], ar[2][16][8], al[2][16][8], br[2][16][8];
-    constexpr window_indices() : a{}, b{}, ar{}, al{}, br{} {
-        for (int h = 0; h < 2; ++h) for (int r = 0; r < 16; ++r) for (int c = 0; c < 8; ++c) {
-            const int element = (c*4+(r%8)/2)*8 + r%2 + (r/8)*2 + h*4;
-            const int pos = ((element+1)*bits + 256*bits - 16) % (256*bits);
+    int a[16][16], b[16][16], ar[16][16], al[16][16], br[16][16];
+    // Double-shift form: state = low 16 bits of (word a : word low) >> shift.
+    int low[16][16], shift[16][16];
+    constexpr window_indices() : a{}, b{}, ar{}, al{}, br{}, low{}, shift{} {
+        for (int r = 0; r < 16; ++r) for (int c = 0; c < 16; ++c) {
+            const int pos = ((tile_element(r, c)+1)*bits + 256*bits - 16) % (256*bits);
             const int offset = pos%32;
-            a[h][r][c] = pos/32;
-            b[h][r][c] = (pos/32+1)%(8*bits);
-            ar[h][r][c] = offset <= 16 ? 16-offset : 32;
-            al[h][r][c] = offset > 16 ? offset-16 : 32;
-            br[h][r][c] = offset > 16 ? 48-offset : 32;
+            a[r][c] = pos/32;
+            b[r][c] = (pos/32+1)%(8*bits);
+            ar[r][c] = offset <= 16 ? 16-offset : 32;
+            al[r][c] = offset > 16 ? offset-16 : 32;
+            br[r][c] = offset > 16 ? 48-offset : 32;
+            low[r][c] = offset > 16 ? b[r][c] : a[r][c];
+            shift[r][c] = offset > 16 ? 48-offset : 16-offset;
         }
     }
 };
 
+#if defined(__AVX2__) && defined(__FMA__)
+// Eight output columns at a time, retaining the scalar K accumulation order.
 template<int bits>
 void dot_tile(const uint8_t * tile, const float * x, const float * lut, float * sum) {
     static constexpr window_indices<bits> index;
@@ -115,46 +126,112 @@ void dot_tile(const uint8_t * tile, const float * x, const float * lut, float * 
         __m256 acc = _mm256_loadu_ps(sum+8*h);
         for (int r = 0; r < 16; ++r) {
             const auto * words = reinterpret_cast<const int *>(tile);
-            const __m256i a = _mm256_i32gather_epi32(words, load(index.a[h][r]), 4);
-            const __m256i b = _mm256_i32gather_epi32(words, load(index.b[h][r]), 4);
-            __m256i state = _mm256_or_si256(_mm256_srlv_epi32(a, load(index.ar[h][r])),
-                                          _mm256_sllv_epi32(a, load(index.al[h][r])));
-            state = _mm256_or_si256(state, _mm256_srlv_epi32(b, load(index.br[h][r])));
+            const __m256i a = _mm256_i32gather_epi32(words, load(index.a[r] + 8*h), 4);
+            const __m256i b = _mm256_i32gather_epi32(words, load(index.b[r] + 8*h), 4);
+            __m256i state = _mm256_or_si256(_mm256_srlv_epi32(a, load(index.ar[r] + 8*h)),
+                                          _mm256_sllv_epi32(a, load(index.al[r] + 8*h)));
+            state = _mm256_or_si256(state, _mm256_srlv_epi32(b, load(index.br[r] + 8*h)));
             state = _mm256_and_si256(state, _mm256_set1_epi32(65535));
             acc = _mm256_fmadd_ps(_mm256_i32gather_ps(lut, state, 4), _mm256_set1_ps(x[r]), acc);
         }
         _mm256_storeu_ps(sum+8*h, acc);
     }
 }
+#else
+template<int bits>
+void dot_tile(const uint8_t * tile, const float * x, const float * lut, float * sum) {
+    for (int c = 0; c < 16; ++c) {
+        float part = sum[c];
+        for (int r = 0; r < 16; ++r) part = std::fma(lut[window<bits>(tile, tile_element(r, c))], x[r], part);
+        sum[c] = part;
+    }
+}
 #endif
 
-template<int bits>
-void dot128(const uint8_t * weights, const float * x, const float * lut,
-            int64_t k, int64_t col0, float * sum) {
-    for (int col = 0; col < had_size; col += 16) {
-        for (int64_t kt = 0; kt < k/16; ++kt) {
-            const uint8_t * tile = weights + (((col0+col)/16)*(k/16)+kt)*32*bits;
-#if defined(__AVX2__) && defined(__FMA__)
-            dot_tile<bits>(tile, x+kt*16, lut, sum+col);
-#else
-            for (int c = 0; c < 16; ++c) {
-                float part = sum[col+c];
-                for (int r = 0; r < 16; ++r) {
-                    const int element = ((c%8)*4+(r%8)/2)*8 + r%2 + (r/8)*2 + (c/8)*4;
-                    part = std::fma(lut[window<bits>(tile, element)], x[kt*16+r], part);
-                }
-                sum[col+c] = part;
-            }
-#endif
-        }
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__F16C__)
+// Same arithmetic as codebook_value(), sixteen states at a time; cb 0/1 are
+// cheaper to compute than to gather from the 256 KB table.
+template<int cb>
+__m512 codebook16(__m512i state, const float * lut) {
+    if constexpr (cb == 2) {
+        return _mm512_i32gather_ps(state, lut, 4);
+    } else {
+        __m512i x = cb == 1 ? _mm512_mullo_epi32(state, _mm512_set1_epi32(int(0xcbac1fedu))) :
+            _mm512_add_epi32(_mm512_mullo_epi32(state, _mm512_set1_epi32(89226354)), _mm512_set1_epi32(64248484));
+        x = _mm512_xor_si512(_mm512_and_si512(x, _mm512_set1_epi32(int(0x8fff8fffu))), _mm512_set1_epi32(0x3b603b60));
+        const __m512 v = _mm512_add_ps(_mm512_cvtph_ps(_mm512_cvtepi32_epi16(x)),
+                                       _mm512_cvtph_ps(_mm512_cvtepi32_epi16(_mm512_srli_epi32(x, 16))));
+        return _mm512_cvtph_ps(_mm512_cvtps_ph(v, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
     }
 }
 
-// Resolve bit width once per operation so circular-window extraction does
-// not perform integer division for every decoded weight.
-using dot_fn = void (*)(const uint8_t *, const float *, const float *, int64_t, int64_t, float *);
-constexpr dot_fn dot_kernels[] = {dot128<1>, dot128<2>, dot128<3>, dot128<4>,
-                                 dot128<5>, dot128<6>, dot128<7>, dot128<8>};
+// Each decoded tile row feeds nx activation rows routed to the same expert.
+// All sixteen columns per row: tiles of up to 4 bits hold at most 32 words,
+// so two registers and a permute replace the word gathers.
+template<int bits, int cb, int nx>
+void dot_tiles16(const uint8_t * weights, const float * const * x, const float * lut,
+                 int64_t k, int64_t col0, float * sum) {
+    static constexpr window_indices<bits> index;
+    constexpr int words = 8*bits;
+    for (int col = 0; col < had_size; col += 16) {
+        __m512 acc[nx];
+        for (int j = 0; j < nx; ++j) acc[j] = _mm512_loadu_ps(sum + j*had_size + col);
+        for (int64_t kt = 0; kt < k/16; ++kt) {
+            const auto * p = reinterpret_cast<const int *>(weights + (((col0+col)/16)*(k/16)+kt)*32*bits);
+            const __m512i lo = _mm512_maskz_loadu_epi32(__mmask16(words >= 16 ? 0xffff : (1u << words) - 1), p);
+            const __m512i hi = _mm512_maskz_loadu_epi32(__mmask16(words > 16 ? (1u << (words-16)) - 1 : 0), p + 16);
+            for (int r = 0; r < 16; ++r) {
+                const __m512i a = _mm512_permutex2var_epi32(lo, _mm512_loadu_si512(index.a[r]), hi);
+#if defined(__AVX512VBMI2__)
+                const __m512i low = _mm512_permutex2var_epi32(lo, _mm512_loadu_si512(index.low[r]), hi);
+                const __m512i state = _mm512_shrdv_epi32(low, a, _mm512_loadu_si512(index.shift[r]));
+#else
+                const __m512i b = _mm512_permutex2var_epi32(lo, _mm512_loadu_si512(index.b[r]), hi);
+                __m512i state = _mm512_or_si512(_mm512_srlv_epi32(a, _mm512_loadu_si512(index.ar[r])),
+                                                _mm512_sllv_epi32(a, _mm512_loadu_si512(index.al[r])));
+                state = _mm512_or_si512(state, _mm512_srlv_epi32(b, _mm512_loadu_si512(index.br[r])));
+#endif
+                const __m512 value = codebook16<cb>(_mm512_and_si512(state, _mm512_set1_epi32(65535)), lut);
+                for (int j = 0; j < nx; ++j) acc[j] = _mm512_fmadd_ps(value, _mm512_set1_ps(x[j][kt*16+r]), acc[j]);
+            }
+        }
+        for (int j = 0; j < nx; ++j) _mm512_storeu_ps(sum + j*had_size + col, acc[j]);
+    }
+}
+#endif
+
+// x holds nx activation rows for one expert; sum holds nx*had_size outputs.
+template<int bits, int cb>
+void dot128(const uint8_t * weights, const float * const * x, int nx, const float * lut,
+            int64_t k, int64_t col0, float * sum) {
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__F16C__)
+    if constexpr (bits <= 4) {
+        for (int j = 0; j < nx; j += tile_rows) {
+            switch (nx - j) {
+                case 1:  dot_tiles16<bits, cb, 1>(weights, x+j, lut, k, col0, sum + j*had_size); break;
+                case 2:  dot_tiles16<bits, cb, 2>(weights, x+j, lut, k, col0, sum + j*had_size); break;
+                case 3:  dot_tiles16<bits, cb, 3>(weights, x+j, lut, k, col0, sum + j*had_size); break;
+                default: dot_tiles16<bits, cb, 4>(weights, x+j, lut, k, col0, sum + j*had_size); break;
+            }
+        }
+        return;
+    }
+#endif
+    for (int j = 0; j < nx; ++j) {
+        float * out = sum + j*had_size;
+        for (int col = 0; col < had_size; col += 16)
+            for (int64_t kt = 0; kt < k/16; ++kt)
+                dot_tile<bits>(weights + (((col0+col)/16)*(k/16)+kt)*32*bits, x[j]+kt*16, lut, out+col);
+    }
+}
+
+// Resolve bit width and codebook once per operation so circular-window
+// extraction does not perform integer division for every decoded weight.
+using dot_fn = void (*)(const uint8_t *, const float * const *, int, const float *, int64_t, int64_t, float *);
+template<int cb>
+constexpr dot_fn dot_row[] = {dot128<1, cb>, dot128<2, cb>, dot128<3, cb>, dot128<4, cb>,
+                              dot128<5, cb>, dot128<6, cb>, dot128<7, cb>, dot128<8, cb>};
+constexpr const dot_fn * dot_kernels[] = {dot_row<0>, dot_row<1>, dot_row<2>};
 
 bool auxiliary_shape(const ggml_tensor * tensor, int64_t width, int64_t experts) {
     return tensor && tensor->type == GGML_TYPE_F16 && tensor->ne[0] == width &&
@@ -194,8 +271,11 @@ size_t ggml_cpu_exl3_work_size(const ggml_tensor * dst, int threads) {
     // keep one per worker; packed weights stay packed in both cases.
     const auto * w = dst->src[0];
     const size_t rows = cache_rows(dst);
-    const size_t transforms = shared_rows(dst) ? shared_rows(dst) : threads;
+    const auto * x = dst->src[1];
+    const size_t all_rows = dst->op == GGML_OP_MUL_MAT_ID ? ggml_nelements(dst->src[2]) : x->ne[1]*x->ne[2];
+    const size_t transforms = shared_rows(dst) ? shared_rows(dst) : size_t(threads)*tile_rows;
     return transforms * size_t(w->ne[0]) * sizeof(float) +
+        (shared_rows(dst) ? 0 : 2*(all_rows+1)*sizeof(int64_t)) +
         (rows ? GGML_PAD(sizeof(cache_state), 64) + rows*w->ne[1]*sizeof(float) : 0);
 }
 
@@ -213,11 +293,14 @@ void ggml_cpu_exl3_compute(const ggml_compute_params * params, ggml_tensor * dst
     const int64_t topk = grouped ? ids->ne[0] : 1;
     const int64_t tokens = grouped ? ids->ne[1] : x->ne[1]*x->ne[2];
     const int bits = ggml_exl3_bits(w->type);
-    const auto dot = dot_kernels[bits-1];
-    const float * lut = codebook(ggml_exl3_codebook(w->type));
+    const int cb = ggml_exl3_codebook(w->type);
+    const auto dot = dot_kernels[cb][bits-1];
+    const float * lut = codebook(cb);
     const int64_t shared = shared_rows(dst);
     float * transformed = static_cast<float *>(params->wdata);
-    float * xh = shared ? nullptr : transformed + params->ith*k;
+    const int64_t n_rows = tokens*topk;
+    float * xh = shared ? nullptr : transformed + params->ith*tile_rows*k;
+    int64_t * order = shared ? nullptr : reinterpret_cast<int64_t *>(transformed + params->nth*tile_rows*k);
 
     // a batched MUL_MAT (weight planes matched to src1 planes) runs plane-major like an expert bank
     auto expert_at = [&](int64_t row) {
@@ -294,29 +377,102 @@ void ggml_cpu_exl3_compute(const ggml_compute_params * params, ggml_tensor * dst
         if (!cache->node) cache = nullptr;
     }
 
+    // Large batches sort rows by expert once and cut each expert's rows into
+    // chunks of tile_rows: order[n_rows] holds the chunk count, then the
+    // n_chunks+1 chunk bounds follow.
+    if (!shared) {
+        if (params->ith == 0) {
+            for (int64_t row = 0; row < n_rows; ++row) order[row] = row;
+            std::sort(order, order + n_rows, [&](int64_t a, int64_t b) {
+                const int32_t ea = expert_at(a), eb = expert_at(b);
+                return ea != eb ? ea < eb : a < b;
+            });
+            int64_t * bounds = order + n_rows + 1;
+            int64_t n_chunks = 0;
+            for (int64_t i = 0; i < n_rows; ++i) {
+                if (!i || i - bounds[n_chunks-1] == tile_rows || expert_at(order[i]) != expert_at(order[i-1])) bounds[n_chunks++] = i;
+            }
+            bounds[n_chunks] = n_rows;
+            order[n_rows] = n_chunks;
+            ggml_threadpool_chunk_set(params->threadpool, 0);
+        }
+        ggml_barrier(params->threadpool);
+    }
+
     // A whole Hadamard output block belongs to one worker, so neither a
     // reduction barrier nor thread-count-dependent summation is required.
     auto compute = [&](bool retry) {
-        int64_t prepared_row = -1;
-        for (int64_t task = params->ith; task < tokens*topk*(n/had_size); task += params->nth) {
-            const int64_t col0 = (task % (n/had_size))*had_size;
-            const int64_t row = task / (n/had_size);
-            const bool hit = cache && (cache->hit_mask & (uint64_t(1) << row));
-            if (hit != retry) continue;
-            const int expert = expert_at(row);
+        if (shared) {
+            // Rows routed to one expert share each decoded weight tile, in
+            // chunks of tile_rows so a single busy expert still spreads across
+            // workers. Every worker derives the same chunks; each row keeps
+            // its own sum order.
+            int32_t experts[cache_max_rows];
+            int64_t order[cache_max_rows];
+            int chunk_begin[cache_max_rows+1];
+            int n_chunks = 0, n_order = 0;
+            uint64_t pending = 0;
+            for (int64_t row = 0; row < shared; ++row) {
+                const bool hit = cache && (cache->hit_mask & (uint64_t(1) << row));
+                if (hit != retry) continue;
+                experts[row] = expert_at(row);
+                pending |= uint64_t(1) << row;
+            }
+            for (int64_t row = 0; row < shared; ++row) {
+                if (!(pending & (uint64_t(1) << row))) continue;
+                int filled = tile_rows;
+                for (int64_t other = row; other < shared; ++other) {
+                    if (!(pending & (uint64_t(1) << other)) || experts[other] != experts[row]) continue;
+                    pending &= ~(uint64_t(1) << other);
+                    if (filled == tile_rows) {
+                        chunk_begin[n_chunks++] = n_order;
+                        filled = 0;
+                    }
+                    order[n_order++] = other;
+                    ++filled;
+                }
+            }
+            chunk_begin[n_chunks] = n_order;
+            for (int64_t task = params->ith; task < n_chunks*(n/had_size); task += params->nth) {
+                const int64_t * rows = order + chunk_begin[task / (n/had_size)];
+                const int nx = int(order + chunk_begin[task / (n/had_size) + 1] - rows);
+                const int64_t col0 = (task % (n/had_size))*had_size;
+                const int32_t expert = experts[rows[0]];
+                if (expert < 0) {
+                    for (int j = 0; j < nx; ++j)
+                        std::memset(static_cast<float *>(dst->data) + rows[j]*n + col0, 0, had_size*sizeof(float));
+                    continue;
+                }
+                const float * acts[tile_rows];
+                for (int j = 0; j < nx; ++j) acts[j] = transformed + rows[j]*k;
+                float sums[tile_rows*had_size] = {};
+                dot(static_cast<const uint8_t *>(w->data) + expert*w->nb[2], acts, nx, lut, k, col0, sums);
+                for (int j = 0; j < nx; ++j) finish(rows[j], col0, sums + j*had_size);
+            }
+            return;
+        }
+        // Large batches: a worker claims a whole chunk, so each activation is
+        // transformed once and every tile is decoded once per chunk.
+        const int64_t * bounds = order + n_rows + 1;
+        for (int64_t chunk; (chunk = ggml_threadpool_chunk_add(params->threadpool, 1)) < order[n_rows];) {
+            const int64_t * rows = order + bounds[chunk];
+            const int nx = int(bounds[chunk+1] - bounds[chunk]);
+            const int32_t expert = expert_at(rows[0]);
             if (expert < 0) {
-                std::memset(static_cast<float *>(dst->data) + row*n + col0, 0, had_size*sizeof(float));
+                for (int j = 0; j < nx; ++j)
+                    std::memset(static_cast<float *>(dst->data) + rows[j]*n, 0, n*sizeof(float));
                 continue;
             }
-            if (!shared && row != prepared_row) {
-                prepare(row, xh);
-                prepared_row = row;
+            const float * acts[tile_rows];
+            for (int j = 0; j < nx; ++j) {
+                prepare(rows[j], xh + j*k);
+                acts[j] = xh + j*k;
             }
-
-            float sum[had_size] = {};
-            const auto * weights = static_cast<const uint8_t *>(w->data) + expert*w->nb[2];
-            dot(weights, shared ? transformed+row*k : xh, lut, k, col0, sum);
-            finish(row, col0, sum);
+            for (int64_t col0 = 0; col0 < n; col0 += had_size) {
+                float sums[tile_rows*had_size] = {};
+                dot(static_cast<const uint8_t *>(w->data) + expert*w->nb[2], acts, nx, lut, k, col0, sums);
+                for (int j = 0; j < nx; ++j) finish(rows[j], col0, sums + j*had_size);
+            }
         }
     };
     compute(false);

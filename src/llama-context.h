@@ -643,6 +643,10 @@ private:
 
     ggml_backend_sched_ptr sched;
     size_t sched_max_nodes = 0;
+    // prompts of up to moe_cache_prompt_tokens on host EXL3 experts decode in
+    // ubatches of moe_cache_prompt_ubatch (0 = no split)
+    uint32_t moe_cache_prompt_ubatch = 0;
+    uint32_t moe_cache_prompt_tokens = 0;
 
     bool sched_need_reserve = true;
     bool sched_need_sampler_reserve = false;
@@ -666,6 +670,7 @@ private:
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
+    llama_context *   threadpool_owner = nullptr; // drafter: borrow the target's pools when none attached
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;

@@ -1657,35 +1657,45 @@ const llama_safetensors_quant_group * llama_safetensors_quant_config::match(cons
     return group;
 }
 
+// tensor name -> shard file name of a model.safetensors.index.json
+static std::map<std::string, std::string> read_weight_map(const std::filesystem::path & index_path) {
+    nlohmann::json index;  // unordered: weight_map has one key per tensor (see parse_shard)
+    {
+        std::ifstream input(index_path);
+        if (!input) {
+            throw std::runtime_error("failed to open JSON file '" + index_path.string() + "'");
+        }
+        try {
+            index = nlohmann::json::parse(input);
+        } catch (const nlohmann::json::exception & e) {
+            throw std::runtime_error("invalid JSON in '" + index_path.string() + "': " + e.what());
+        }
+    }
+    if (!index.is_object() || !index.contains("weight_map") || !index.at("weight_map").is_object()) {
+        throw std::runtime_error("safetensors index is missing an object-valued weight_map");
+    }
+    std::map<std::string, std::string> result;
+    for (const auto & [tensor_name, shard_json] : index.at("weight_map").items()) {
+        if (!shard_json.is_string()) {
+            throw std::runtime_error("non-string shard name for indexed tensor '" + tensor_name + "'");
+        }
+        result.emplace(tensor_name, shard_json.get<std::string>());
+    }
+    return result;
+}
+
 llama_safetensors_registry llama_safetensors_registry::load(
         const std::filesystem::path & model_dir, llama_safetensors_io_mode io_mode) {
     llama_safetensors_registry result;
+    result.io_mode_ = io_mode;
     const auto                 index_path = model_dir / "model.safetensors.index.json";
 
     std::map<std::string, std::string> expected_shards;
     std::set<std::string>              shard_names;
     if (std::filesystem::is_regular_file(index_path)) {
-        nlohmann::json index;  // unordered: weight_map has one key per tensor (see parse_shard)
-        {
-            std::ifstream input(index_path);
-            if (!input) {
-                throw std::runtime_error("failed to open JSON file '" + index_path.string() + "'");
-            }
-            try {
-                index = nlohmann::json::parse(input);
-            } catch (const nlohmann::json::exception & e) {
-                throw std::runtime_error("invalid JSON in '" + index_path.string() + "': " + e.what());
-            }
-        }
-        if (!index.is_object() || !index.contains("weight_map") || !index.at("weight_map").is_object()) {
-            throw std::runtime_error("safetensors index is missing an object-valued weight_map");
-        }
-        for (const auto & [tensor_name, shard_json] : index.at("weight_map").items()) {
-            if (!shard_json.is_string()) {
-                throw std::runtime_error("non-string shard name for indexed tensor '" + tensor_name + "'");
-            }
-            const std::string shard_name = shard_json.get<std::string>();
-            expected_shards.emplace(tensor_name, shard_name);
+        expected_shards = read_weight_map(index_path);
+        for (const auto & [tensor_name, shard_name] : expected_shards) {
+            (void) tensor_name;
             shard_names.insert(shard_name);
         }
     } else if (std::filesystem::is_regular_file(model_dir / "model.safetensors")) {
@@ -1772,19 +1782,54 @@ llama_safetensors_registry llama_safetensors_registry::load(
                        __func__, recovered_tensors, first_recovered.c_str());
     }
 
-    result.files_.reserve(result.shards_.size());
-    for (const llama_safetensors_shard & shard : result.shards_) {
-        result.files_.push_back(std::make_unique<llama_file>(
-            shard.path.string().c_str(), "rb", io_mode == llama_safetensors_io_mode::DIRECT));
+    result.open_files(io_mode);
+    return result;
+}
+
+void llama_safetensors_registry::add_from(
+        const std::filesystem::path & dir, const std::vector<std::string> & tensor_names) {
+    const auto weight_map = read_weight_map(dir / "model.safetensors.index.json");
+    std::map<std::string, std::set<std::string>> wanted; // shard -> tensors taken from it
+    for (const std::string & name : tensor_names) {
+        const auto it = weight_map.find(name);
+        if (it == weight_map.end()) {
+            throw std::runtime_error("'" + dir.string() + "' does not index tensor '" + name + "'");
+        }
+        wanted[it->second].insert(name);
     }
-    if (io_mode == llama_safetensors_io_mode::MMAP && llama_mmap::SUPPORTED) {
-        result.mappings_.reserve(result.shards_.size());
-        for (const auto & file : result.files_) {
-            result.mappings_.push_back(std::make_unique<llama_mmap>(file.get(), 0, false));
+    for (const auto & [shard_name, names] : wanted) {
+        parsed_shard parsed = parse_shard(checked_shard_path(dir, shard_name), uint32_t(shards_.size()));
+        shards_.push_back(std::move(parsed.shard));
+        for (auto & tensor : parsed.tensors) {
+            if (names.count(tensor.name) == 0) {
+                continue;
+            }
+            if (!tensor_index_.emplace(tensor.name, tensors_.size()).second) {
+                throw std::runtime_error("duplicate safetensors tensor '" + tensor.name + "'");
+            }
+            tensors_.push_back(std::move(tensor));
         }
     }
+    for (const std::string & name : tensor_names) {
+        if (tensor_index_.find(name) == tensor_index_.end()) {
+            throw std::runtime_error("weight_map tensor '" + name + "' is missing from its shard");
+        }
+    }
+    open_files(io_mode_);
+}
 
-    return result;
+// opens the shards appended since the last call
+void llama_safetensors_registry::open_files(llama_safetensors_io_mode io_mode) {
+    const size_t first = files_.size();
+    for (size_t i = first; i < shards_.size(); ++i) {
+        files_.push_back(std::make_unique<llama_file>(
+            shards_[i].path.string().c_str(), "rb", io_mode == llama_safetensors_io_mode::DIRECT));
+    }
+    if (io_mode == llama_safetensors_io_mode::MMAP && llama_mmap::SUPPORTED) {
+        for (size_t i = first; i < files_.size(); ++i) {
+            mappings_.push_back(std::make_unique<llama_mmap>(files_[i].get(), 0, false));
+        }
+    }
 }
 
 const llama_safetensors_tensor * llama_safetensors_registry::find(const std::string & name) const {

@@ -4,6 +4,7 @@
 #include "llama-kv-cache-dsv4.h"
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -81,19 +82,24 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         }
     }
 
-    // Engram: the PLE n-gram hash of qwen4exp with one set of hash constants per Engram layer, stored back to back
+    // Engram: the PLE n-gram hash of qwen4exp with one set of hash constants per Engram layer, stored back to back;
+    // either one table with global offsets (ple.* keys) or one table per Engram layer with offsets local to it (engram.* keys)
     std::vector<uint32_t> e_layers;
     ml.get_arr(LLM_KV_PLE_LAYERS, e_layers, false);
+    const bool split_tables = e_layers.empty();
+    if (split_tables) {
+        ml.get_arr(LLM_KV_ENGRAM_LAYERS, e_layers, false);
+    }
     if (!e_layers.empty()) {
         std::vector<uint64_t> mult;
         std::vector<uint64_t> offsets;
         std::vector<uint64_t> primes;
-        ml.get_key(LLM_KV_PLE_NGRAM_SIZE,             hparams.ple_ngram_size);
-        ml.get_key(LLM_KV_PLE_HEADS_PER_NGRAM,        hparams.ple_heads_per_ngram);
-        ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.ple_head_dim);
-        ml.get_arr(LLM_KV_PLE_LAYER_MULTIPLIERS,      mult);
-        ml.get_arr(LLM_KV_PLE_HEAD_OFFSETS,           offsets);
-        ml.get_arr(LLM_KV_PLE_HEAD_VOCAB_SIZES,       primes);
+        ml.get_key(split_tables ? LLM_KV_ENGRAM_MAX_NGRAM_SIZE : LLM_KV_PLE_NGRAM_SIZE,             hparams.ple_ngram_size);
+        ml.get_key(split_tables ? LLM_KV_ENGRAM_HEAD_COUNT     : LLM_KV_PLE_HEADS_PER_NGRAM,        hparams.ple_heads_per_ngram);
+        ml.get_key(split_tables ? LLM_KV_ENGRAM_HEAD_DIM       : LLM_KV_EMBEDDING_LENGTH_PER_LAYER, hparams.ple_head_dim);
+        ml.get_arr(split_tables ? LLM_KV_ENGRAM_MULTIPLIERS    : LLM_KV_PLE_LAYER_MULTIPLIERS,      mult);
+        ml.get_arr(split_tables ? LLM_KV_ENGRAM_OFFSETS        : LLM_KV_PLE_HEAD_OFFSETS,           offsets);
+        ml.get_arr(split_tables ? LLM_KV_ENGRAM_PRIMES         : LLM_KV_PLE_HEAD_VOCAB_SIZES,       primes);
         ml.get_key(LLM_KV_ENGRAM_PAD_TOKEN_ID,        hparams.engram_pad_id);
         ml.get_arr(LLM_KV_ENGRAM_TOKEN_MAP,           engram_token_map);
 
@@ -142,17 +148,33 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
     const int64_t n_idx_embd      = hparams.indexer_head_size;
     const int64_t n_idx_head      = hparams.indexer_n_head;
 
+    // EXL3 svh ("scale", [n]) / suh ("input_scale", [k]) vectors, one per group for the stacked wo_a; the generic
+    // loader covers wq_a, wq_b, the experts and output
+    const auto create_exl3_side = [&](const LLM_TN_IMPL & name, const ggml_tensor * weight, int64_t n) -> ggml_tensor * {
+        if (weight == nullptr || !ggml_type_is_exl3(weight->type)) {
+            return nullptr;
+        }
+        return weight->ne[2] > 1 ? create_tensor(name, { n, weight->ne[2] }, 0) : create_tensor(name, { n }, 0);
+    };
+    const auto create_exl3_sides = [&](llm_tensor tensor, int il, ggml_tensor * weight, ggml_tensor *& scale, ggml_tensor *& in_scale) {
+        if (weight) {
+            scale    = create_exl3_side(tn(tensor, "scale", il),       weight, weight->ne[1]);
+            in_scale = create_exl3_side(tn(tensor, "input_scale", il), weight, weight->ne[0]);
+        }
+    };
+
     tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
 
-    // all Engram tables in one lazily read tensor, like the qwen4exp n-gram table
-    if (hparams.ple_n_heads > 0) {
+    // the Engram tables are read lazily, like the qwen4exp n-gram table: either all in one tensor or one per Engram layer
+    const bool split_tables = hparams.ple_n_heads > 0 && !ml.get_weight(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str().c_str());
+    const auto create_engram_table = [&](const LLM_TN_IMPL & tname, size_t c0, size_t c1) {
         int64_t n_rows = 0;
-        for (size_t c = 0; c < (size_t) hparams.ple_n_modules*hparams.ple_n_heads; ++c) {
+        for (size_t c = c0; c < c1; ++c) {
             n_rows = std::max(n_rows, (int64_t) hparams.ple_head_offsets[c] + hparams.ple_head_vocab_sizes[c]);
         }
-        const std::string name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
+        const std::string name = tname.str();
         if (const auto * w = ml.get_weight(name.c_str())) {
             if (w->tensor->ne[1] < n_rows) {
                 throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the Engram heads (%" PRId64 ")",
@@ -160,7 +182,10 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
             }
             n_rows = w->tensor->ne[1];
         }
-        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"), {(int64_t) hparams.ple_head_dim, n_rows}, TENSOR_READ_LAZY);
+        return create_tensor(tname, {(int64_t) hparams.ple_head_dim, n_rows}, TENSOR_READ_LAZY);
+    };
+    if (hparams.ple_n_heads > 0 && !split_tables) {
+        per_layer_tok_embd = create_engram_table(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"), 0, (size_t) hparams.ple_n_modules*hparams.ple_n_heads);
     }
 
     for (int i = 0; i < n_layer; ++i) {
@@ -175,6 +200,9 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         layer.attn_kv_norm  = create_tensor(tn(LLM_TENSOR_ATTN_KV_NORM,  "weight", i), {n_embd_head}, 0);
         layer.wo_a          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_A,    "weight", i), {n_head * n_embd_head / o_groups, o_lora_rank, o_groups}, TENSOR_ALLOW_RESHAPE);
         layer.wo_b          = create_tensor(tn(LLM_TENSOR_ATTN_OUT_B,    "weight", i), {o_groups * o_lora_rank, n_embd}, 0);
+        create_exl3_sides(LLM_TENSOR_ATTN_KV,    i, layer.wkv,  layer.wkv_s,  layer.wkv_in_s);
+        create_exl3_sides(LLM_TENSOR_ATTN_OUT_A, i, layer.wo_a, layer.wo_a_s, layer.wo_a_in_s);
+        create_exl3_sides(LLM_TENSOR_ATTN_OUT_B, i, layer.wo_b, layer.wo_b_s, layer.wo_b_in_s);
 
         layer.hc_attn_fn    = create_tensor(tn(LLM_TENSOR_HC_ATTN_FN,    "weight", i), {hc_dim, hc_mix_dim}, 0);
         layer.hc_attn_base  = create_tensor(tn(LLM_TENSOR_HC_ATTN_BASE,  "weight", i), {hc_mix_dim}, 0);
@@ -191,15 +219,37 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
             }
             layer.indexer_attn_k = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_K, "weight", i), {n_embd_head, n_idx_embd}, 0);
             layer.indexer_k_norm = create_tensor(tn(LLM_TENSOR_INDEXER_K_NORM, "weight", i), {n_idx_embd}, 0);
+            create_exl3_sides(LLM_TENSOR_ATTN_COMPRESSOR_WKV,   i, layer.attn_comp_wkv,   layer.attn_comp_wkv_s,   layer.attn_comp_wkv_in_s);
+            create_exl3_sides(LLM_TENSOR_ATTN_COMPRESSOR_WGATE, i, layer.attn_comp_wgate, layer.attn_comp_wgate_s, layer.attn_comp_wgate_in_s);
+            create_exl3_sides(LLM_TENSOR_INDEXER_ATTN_K,        i, layer.indexer_attn_k,  layer.indexer_attn_k_s,  layer.indexer_attn_k_in_s);
         }
         if (hparams.dsv41_topk_src[i] == i) {
             layer.indexer_attn_q_b = create_tensor(tn(LLM_TENSOR_INDEXER_ATTN_Q_B, "weight", i), {q_lora_rank, n_idx_head * n_idx_embd}, 0);
             layer.indexer_proj     = create_tensor(tn(LLM_TENSOR_INDEXER_PROJ,     "weight", i), {n_embd, n_idx_head}, 0);
+            create_exl3_sides(LLM_TENSOR_INDEXER_ATTN_Q_B, i, layer.indexer_attn_q_b, layer.indexer_attn_q_b_s, layer.indexer_attn_q_b_in_s);
+            create_exl3_sides(LLM_TENSOR_INDEXER_PROJ,     i, layer.indexer_proj,     layer.indexer_proj_s,     layer.indexer_proj_in_s);
         }
 
-        if (engram_index(i) >= 0) {
-            layer.engram_kv   = create_tensor(tn(LLM_TENSOR_ENGRAM_KV,   "weight", i), {(int64_t) hparams.ple_n_heads * hparams.ple_head_dim, n_embd * (hc_mult + 1)}, 0);
+        if (const int e = engram_index(i); e >= 0) {
+            if (split_tables) {
+                layer.engram_embd = create_engram_table(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i),
+                                                        (size_t) e*hparams.ple_n_heads, (size_t) (e + 1)*hparams.ple_n_heads);
+                // the checkpoint keeps its fp8 tables with one power-of-two scale per row block; gathered and applied in-graph
+                const std::string scale_name = tn(LLM_TENSOR_ENGRAM_EMBD, "scale", i).str();
+                ggml_type scale_type = GGML_TYPE_COUNT;
+                std::array<int64_t, GGML_MAX_DIMS> scale_ne{};
+                if (ml.get_tensor_info(scale_name.c_str(), scale_type, scale_ne)) {
+                    if (scale_ne[0] <= 0 || hparams.ple_head_dim % scale_ne[0] != 0) {
+                        throw std::runtime_error(format("%s has %" PRId64 " blocks per row, which does not divide the Engram head dim %u",
+                                                        scale_name.c_str(), scale_ne[0], hparams.ple_head_dim));
+                    }
+                    layer.engram_embd_s = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "scale", i),
+                                                        {scale_ne[0], layer.engram_embd->ne[1]}, TENSOR_READ_LAZY);
+                }
+            }
+            layer.engram_kv  = create_tensor(tn(LLM_TENSOR_ENGRAM_KV,   "weight", i), {(int64_t) hparams.ple_n_heads * hparams.ple_head_dim, n_embd * (hc_mult + 1)}, 0);
             layer.engram_gate = create_tensor(tn(LLM_TENSOR_ENGRAM_GATE, "weight", i), {n_embd, hc_mult}, 0);
+            create_exl3_sides(LLM_TENSOR_ENGRAM_KV, i, layer.engram_kv, layer.engram_kv_s, layer.engram_kv_in_s);
         }
 
         layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
@@ -287,6 +337,8 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::vector<ggml_tensor *> engram_ids;
+    std::vector<ggml_tensor *> engram_tables; // the table each engram_ids gathers from
+    std::vector<ggml_tensor *> engram_scales; // its row-block scale table, or null
     ggml_tensor * engram_keep = nullptr;    // 0 for embedding (image) tokens; only in mixed ubatches
     ggml_tensor * cand_pin = nullptr;
     bool cand_csa = false;
@@ -311,9 +363,15 @@ void llm_graph_input_dsv41::set_input(const llama_ubatch * ubatch) {
         for (size_t e = 0; e < engram_ids.size(); ++e) {
             model.engram_hash((int) e, *ubatch, prev, ids[e]);
             all.insert(all.end(), ids[e].begin(), ids[e].end());
-        }
-        if (model.can_prefetch.count(model.per_layer_tok_embd)) {
-            llama_prefetch_rows(model.per_layer_tok_embd, all.data(), all.size());
+            if (e + 1 < engram_ids.size() && engram_tables[e + 1] == engram_tables[e]) {
+                continue;
+            }
+            for (const ggml_tensor * t : { engram_tables[e], engram_scales[e] }) {
+                if (model.can_prefetch.count(t)) {
+                    llama_prefetch_rows(t, all.data(), all.size());
+                }
+            }
+            all.clear();
         }
         for (size_t e = 0; e < engram_ids.size(); ++e) {
             if (engram_ids[e]->buffer) {
@@ -381,7 +439,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_engram(
 
     GGML_ASSERT(rows->ne[0] == (int64_t) (hparams.ple_head_dim*hparams.ple_n_heads) && rows->ne[1] == nt);
 
-    ggml_tensor * kv = build_lora_mm(layer.engram_kv, rows);
+    ggml_tensor * kv = build_lora_mm(layer.engram_kv, rows, layer.engram_kv_s, layer.engram_kv_in_s);
     cb(kv, "engram_kv", il);
 
     ggml_tensor * key   = ggml_cont(ctx0, ggml_view_3d(ctx0, kv, n_embd, hc, nt, ggml_row_size(kv->type, n_embd), kv->nb[1], 0));
@@ -442,14 +500,14 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         return ggml_rope_set_offset(t, n_nope);
     };
 
-    ggml_tensor * qr = build_norm(build_lora_mm(layer.wq_a, cur), layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+    ggml_tensor * qr = build_norm(build_lora_mm(layer.wq_a, cur, layer.wq_a_s, layer.wq_a_in_s), layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
     cb(qr, "qr_norm", il);
 
-    ggml_tensor * q = ggml_reshape_3d(ctx0, build_lora_mm(layer.wq_b, qr), n_embd_head, n_head, nt);
+    ggml_tensor * q = ggml_reshape_3d(ctx0, build_lora_mm(layer.wq_b, qr, layer.wq_b_s, layer.wq_b_in_s), n_embd_head, n_head, nt);
     q = rope(q, inp_pos, n_embd_head_nope);
     cb(q, "q", il);
 
-    ggml_tensor * kv = build_norm(build_lora_mm(layer.wkv, cur), layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
+    ggml_tensor * kv = build_norm(build_lora_mm(layer.wkv, cur, layer.wkv_s, layer.wkv_in_s), layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
     kv = rope(ggml_reshape_3d(ctx0, kv, n_embd_head, 1, nt), inp_pos, n_embd_head_nope);
     cb(kv, "kv", il);
 
@@ -463,8 +521,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         GGML_ASSERT(hparams.dsv41_kv_src[il] >= 0 && (int64_t) comp_state->get_ratio() == ratio);
 
         if (hparams.dsv41_kv_src[il] == il && ci.state_pos) {
-            ggml_tensor * state_kv    = build_lora_mm(layer.attn_comp_wkv, cur);
-            ggml_tensor * state_score = ratio > 1 ? build_lora_mm(layer.attn_comp_wgate, cur) : ggml_fill(ctx0, state_kv, 0.0f);
+            ggml_tensor * state_kv    = build_lora_mm(layer.attn_comp_wkv, cur, layer.attn_comp_wkv_s, layer.attn_comp_wkv_in_s);
+            ggml_tensor * state_score = ratio > 1 ? build_lora_mm(layer.attn_comp_wgate, cur, layer.attn_comp_wgate_s, layer.attn_comp_wgate_in_s) : ggml_fill(ctx0, state_kv, 0.0f);
 
             ggml_tensor * restored_kv    = comp_state->get_kv_all(ctx0, il);
             ggml_tensor * restored_score = comp_state->get_score_all(ctx0, il);
@@ -492,7 +550,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 cb(comp, "comp_latent", il);
 
                 // index K from the RoPE-free latent; a latent stands for the first token of its group
-                ggml_tensor * ik = build_norm(build_lora_mm(layer.indexer_attn_k, comp), layer.indexer_k_norm, nullptr, LLM_NORM_RMS, il);
+                // EXL3 projections take one input plane, so project the [n_embd_head, 1, n_blocks] latents as a matrix
+                ggml_tensor * ik = build_lora_mm(layer.indexer_attn_k, ggml_reshape_2d(ctx0, comp, n_embd_head, n_blocks), layer.indexer_attn_k_s, layer.indexer_attn_k_in_s);
+                ik = build_norm(ggml_reshape_3d(ctx0, ik, n_idx_embd, 1, n_blocks), layer.indexer_k_norm, nullptr, LLM_NORM_RMS, il);
                 ik = rope(ik, ci.state_write_pos, n_idx_embd - n_embd_head_rope);
                 comp = rope(comp, ci.state_write_pos, n_embd_head_nope);
 
@@ -540,11 +600,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 ik = ggml_cont(ctx0, ik);
             }
 
-            ggml_tensor * iq = ggml_reshape_3d(ctx0, build_lora_mm(layer.indexer_attn_q_b, qr), n_idx_embd, n_idx_head, nt);
+            ggml_tensor * iq = ggml_reshape_3d(ctx0, build_lora_mm(layer.indexer_attn_q_b, qr, layer.indexer_attn_q_b_s, layer.indexer_attn_q_b_in_s), n_idx_embd, n_idx_head, nt);
             iq = rope(iq, inp_pos, n_idx_embd - n_embd_head_rope);
             iq = ggml_view_4d(ctx0, iq, iq->ne[0], iq->ne[1], nt/n_stream, n_stream, iq->nb[1], iq->nb[2], iq->nb[2]*(nt/n_stream), 0);
 
-            ggml_tensor * iw = ggml_scale(ctx0, build_lora_mm(layer.indexer_proj, cur), 1.0f/sqrtf(float(n_idx_embd*n_idx_head)));
+            ggml_tensor * iw = ggml_scale(ctx0, build_lora_mm(layer.indexer_proj, cur, layer.indexer_proj_s, layer.indexer_proj_in_s), 1.0f/sqrtf(float(n_idx_embd*n_idx_head)));
             iw = ggml_view_4d(ctx0, iw, iw->ne[0], nt/n_stream, 1, n_stream, iw->nb[1], iw->nb[1]*(nt/n_stream), iw->nb[1]*(nt/n_stream), 0);
 
             // chunk queries so the [n_ih, tokens, n_comp] scores stay near 2^26 elements (at most 64 chunks); the fused indexer runs as one chunk
@@ -755,11 +815,15 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     cb(out, "attn_derope", il);
 
     out = ggml_permute(ctx0, ggml_reshape_3d(ctx0, out, n_head/n_groups*n_embd_head, n_groups, nt), 0, 2, 1, 3);
-    ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
+    if (ggml_type_is_exl3(layer.wo_a->type)) {
+        // the EXL3 batched matmul needs contiguous activation planes
+        out = ggml_cont(ctx0, out);
+    }
+    ggml_tensor * oa = build_lora_mm(layer.wo_a, out, layer.wo_a_s, layer.wo_a_in_s);
     cb(oa, "attn_wo_a", il);
     oa = ggml_cont_2d(ctx0, ggml_permute(ctx0, oa, 0, 2, 1, 3), o_lora_rank*n_groups, nt);
 
-    out = build_lora_mm(layer.wo_b, oa);
+    out = build_lora_mm(layer.wo_b, oa, layer.wo_b_s, layer.wo_b_in_s);
     cb(out, "attn_out", il);
 
     return out;
@@ -794,9 +858,19 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
         ggml_tensor * ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) hparams.ple_n_heads*n_tokens);
         ggml_set_name(ids, ("engram_ids-" + std::to_string(il)).c_str());
         ggml_set_input(ids);
+        ggml_tensor * table = model.layers[il].engram_embd ? model.layers[il].engram_embd : model.per_layer_tok_embd;
         inp41->engram_ids.push_back(ids);
+        inp41->engram_tables.push_back(table);
 
-        ggml_tensor * rows = ggml_get_rows(ctx0, model.per_layer_tok_embd, ids);
+        inp41->engram_scales.push_back(model.layers[il].engram_embd_s);
+
+        ggml_tensor * rows = ggml_get_rows(ctx0, table, ids);
+        if (ggml_tensor * scale = model.layers[il].engram_embd_s) {
+            const int64_t nb = scale->ne[0];
+            ggml_tensor * s = ggml_get_rows(ctx0, scale, ids);
+            rows = ggml_mul(ctx0, ggml_reshape_3d(ctx0, rows, hparams.ple_head_dim/nb, nb, rows->ne[1]),
+                                  ggml_reshape_3d(ctx0, s, 1, nb, s->ne[1]));
+        }
         rows = ggml_reshape_2d(ctx0, rows, hparams.ple_head_dim*hparams.ple_n_heads, n_tokens);
         cb(rows, "engram_rows", il);
         ggml_build_forward_expand(gf, rows);
@@ -899,14 +973,17 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
                 LLM_FFN_SILU, hparams.expert_weights_norm && hparams.n_expert_used() > 1,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il, logits);
+                il, logits, nullptr,
+                layer.ffn_up_exps_s, layer.ffn_gate_exps_s, layer.ffn_down_exps_s, nullptr,
+                layer.ffn_up_exps_in_s, layer.ffn_gate_exps_in_s, layer.ffn_down_exps_in_s);
         cb(moe_out, "ffn_moe_out", il);
 
         ggml_tensor * ffn_shexp = build_ffn(cur,
-                layer.ffn_up_shexp, nullptr, nullptr,
-                layer.ffn_gate_shexp, nullptr, nullptr,
-                layer.ffn_down_shexp, nullptr, nullptr,
-                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+                layer.ffn_up_shexp, nullptr, layer.ffn_up_shexp_s,
+                layer.ffn_gate_shexp, nullptr, layer.ffn_gate_shexp_s,
+                layer.ffn_down_shexp, nullptr, layer.ffn_down_shexp_s,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il,
+                layer.ffn_up_shexp_in_s, layer.ffn_gate_shexp_in_s, layer.ffn_down_shexp_in_s);
         cb(ffn_shexp, "ffn_shexp", il);
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
@@ -929,7 +1006,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model_base, const llm_g
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = build_lora_mm(model.output, cur, model.output_s, model.output_in_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 

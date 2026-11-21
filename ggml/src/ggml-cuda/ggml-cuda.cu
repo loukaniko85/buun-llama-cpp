@@ -97,6 +97,7 @@
 #include "ggml-cuda/fp8-channel-bf16.cuh"
 #include "ggml-cuda/marlin-q4-a32.cuh"
 #include "ggml-cuda/marlin-q8-g128.cuh"
+#include "ggml-cuda/moe-zc-share.cuh"
 #include "ggml.h"
 
 
@@ -211,6 +212,36 @@ cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
         err = cudaMalloc(ptr, size);
     }
     return err;
+}
+
+// Graph buffers and the pool grow after the MoE cache has taken free-minus-reserve, and each growth would eat the
+// free memory that lazily loaded kernel modules need: a load that fails for memory leaves its kernel unlaunchable
+// even after a trim. Surrender cache storage first so growth leaves a floor free.
+static void ggml_cuda_keep_free_floor(int device, size_t size) {
+    constexpr size_t floor_bytes = 4 * ggml_cuda_compute_vmm_chunk;
+    size_t free_bytes = 0, total_bytes = 0;
+    if (ggml_cuda_device_memory_info(device, &free_bytes, &total_bytes) == cudaSuccess && free_bytes < size + floor_bytes) {
+        ggml_moe_cache_trim(device, size + floor_bytes - free_bytes);
+    }
+}
+
+static cudaError_t ggml_cuda_device_malloc_trim(void ** ptr, size_t size, int device) {
+    ggml_cuda_keep_free_floor(device, size);
+    cudaError_t err = ggml_cuda_device_malloc(ptr, size, device);
+    while (err == cudaErrorMemoryAllocation && ggml_moe_cache_trim(device, size) > 0) {
+        (void)cudaGetLastError();
+        err = ggml_cuda_device_malloc(ptr, size, device);
+    }
+    return err;
+}
+
+void ggml_cuda_set_max_dynamic_smem_impl(const void * kernel, int nbytes) {
+    cudaError_t err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes);
+    while (err == cudaErrorMemoryAllocation && ggml_moe_cache_trim(ggml_cuda_get_device(), ggml_cuda_compute_vmm_chunk) > 0) {
+        (void)cudaGetLastError();
+        err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes);
+    }
+    CUDA_CHECK(err);
 }
 
 #if defined(GGML_USE_HIP)
@@ -532,7 +563,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
-        cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+        cudaError_t err = ggml_cuda_device_malloc_trim(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
             const size_t cached_bytes = pool_size;
@@ -540,12 +571,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                            device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
             CUDA_CHECK(cudaDeviceSynchronize());
             clear_pool();
-            err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
-            // Last resort: surrender cache storage before aborting on allocation failure.
-            while (err == cudaErrorMemoryAllocation && ggml_moe_cache_trim(device, look_ahead_size) > 0) {
-                (void)cudaGetLastError();
-                err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
-            }
+            err = ggml_cuda_device_malloc_trim(&ptr, look_ahead_size, device);
             if (err == cudaSuccess) {
                 GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: retry succeeded\n", device);
             }
@@ -698,6 +724,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #else
                 CUDA_ERROR_OUT_OF_MEMORY;
 #endif
+            ggml_cuda_keep_free_floor(device, reserve_size);
             auto create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
             if (create_result == out_of_memory) {
                 GGML_LOG_WARN(GGML_CUDA_NAME " pool[%d]: growing %.2f MiB to %.2f MiB failed\n",
@@ -1183,6 +1210,8 @@ struct ggml_cuda_upload_ring {
     size_t      offset   = 0;
     bool        disabled = false;
     cudaEvent_t event    = nullptr;
+    uint64_t    n_uploads = 0;
+    std::vector<std::pair<cudaStream_t, uint64_t>> waited; // stream -> n_uploads it is ordered after
 };
 // One ring per (thread, device): cudaStreamPerThread and the event belong to the current device's
 // context, and a shared host ring would let a wrap-around sync on one device race pending copies
@@ -1210,6 +1239,7 @@ static bool ggml_cuda_upload_async(void * dst, const void * data, size_t size) {
     memcpy(ring.host + ring.offset, data, size);
     CUDA_CHECK(cudaMemcpyAsync(dst, ring.host + ring.offset, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     ring.offset += size;
+    ring.n_uploads++;
     return true;
 }
 
@@ -1219,11 +1249,27 @@ static void ggml_cuda_wait_uploads(cudaStream_t stream) {
     if (ring.host == nullptr) {
         return;
     }
+    // a wait captured into a graph does not order the live stream: never consult or record it
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture));
+    auto waited = capture == cudaStreamCaptureStatusNone ?
+        std::find_if(ring.waited.begin(), ring.waited.end(), [&](const auto & w) { return w.first == stream; }) : ring.waited.end();
+    if (waited != ring.waited.end() && waited->second == ring.n_uploads) {
+        return;
+    }
     if (ring.event == nullptr) {
         CUDA_CHECK(cudaEventCreateWithFlags(&ring.event, cudaEventDisableTiming));
     }
     CUDA_CHECK(cudaEventRecord(ring.event, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamWaitEvent(stream, ring.event, 0));
+    if (capture != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    if (waited != ring.waited.end()) {
+        waited->second = ring.n_uploads;
+    } else {
+        ring.waited.emplace_back(stream, ring.n_uploads);
+    }
 }
 
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -1553,7 +1599,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 #endif
 
     void * dev_ptr;
-    cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    cudaError_t err = ggml_cuda_device_malloc_trim(&dev_ptr, size, buft_ctx->device);
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -4211,7 +4257,8 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
         ggml_cuda_canonicalize_repacked(buf_ctx, tensor);
     }
 #endif
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    // host weights may hold registered fill sources: split the copy at their edges
+    CUDA_CHECK(moe_zc_memcpy_h2d_async((char *) tensor->data + offset, data, size, cuda_ctx->stream()));
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -9831,8 +9878,42 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 ggml_cuda_gdn_state_read_plan(cuda_ctx, cgraph, gdn_state_read_skip);
             }
 
+            // first consumer of a side-stream upload; its other producers are marked as outputs
+            // for this evaluation so no fusion pulls the consumer in ahead of the wait
+            int deferred_at = -1;
+            ggml_tensor * deferred_barriers[GGML_MAX_SRC] = {};
+            if (cuda_ctx->deferred_input) {
+                const ggml_tensor * input = cuda_ctx->deferred_input;
+                for (int i = 0; i < cgraph->n_nodes && deferred_at < 0; i++) {
+                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                        const ggml_tensor * src = cgraph->nodes[i]->src[j];
+                        if (src && (src == input || src->view_src == input)) {
+                            deferred_at = i;
+                            break;
+                        }
+                    }
+                }
+                deferred_at = std::max(deferred_at, 0);
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    ggml_tensor * src = cgraph->nodes[deferred_at]->src[j];
+                    if (src && src != input && !(src->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                        src->flags |= GGML_TENSOR_FLAG_OUTPUT;
+                        deferred_barriers[j] = src;
+                    }
+                }
+            }
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (deferred_at >= 0 && i >= deferred_at) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+                    const unsigned int wait_flags = 0;
+#else
+                    const unsigned int wait_flags = use_cuda_graph && cuda_graph_update_required ? cudaEventWaitExternal : 0;
+#endif
+                    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), cuda_ctx->deferred_input_event, wait_flags));
+                    deferred_at = -1;
+                }
 #ifdef USE_CUDA_GRAPH
                 if (seg_every > 0 && i >= seg_next && !is_concurrent_event_active) {
                     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
@@ -9894,6 +9975,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                GGML_ASSERT(deferred_at < 0 || i + nodes_to_skip < deferred_at);
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -9931,6 +10013,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
+            }
+            for (ggml_tensor * barrier : deferred_barriers) {
+                if (barrier) {
+                    barrier->flags &= ~GGML_TENSOR_FLAG_OUTPUT;
+                }
             }
         }
 
@@ -10109,6 +10196,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             GGML_LOG_DEBUG("%s: CUDA graph incompatible with this batch; running eagerly\n", __func__);
         }
     }
+    // a graph captured without the deferred-input wait would read the input before its upload
+    if (use_cuda_graph && !cuda_graph_update_required && cuda_ctx->deferred_input && !graph->deferred_input_wait) {
+        cuda_graph_update_required = true;
+    }
+    if (use_cuda_graph && cuda_graph_update_required) {
+        graph->deferred_input_wait = cuda_ctx->deferred_input != nullptr;
+    }
 #endif // USE_CUDA_GRAPH
 
     if (use_cuda_graph && cuda_graph_update_required) {
@@ -10123,7 +10217,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     try {
         ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+        cuda_ctx->deferred_input = nullptr;
     } catch (const ggml_cuda_pool_alloc_failure &) {
+        cuda_ctx->deferred_input = nullptr;
 #ifdef USE_CUDA_GRAPH
         if (use_cuda_graph && cuda_graph_update_required) {
             // A capture owns one global CUDA-pool lock count until EndCapture. The
