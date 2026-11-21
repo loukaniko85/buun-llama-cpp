@@ -41,17 +41,18 @@ jobs:
 
       - name: Work around upstream HIP break (lightning_deferred_k)
         run: |
-          # upstream d2407c33 declares ggml_backend_cuda_context::lightning_deferred_k
-          # inside "#if !defined(GGML_USE_HIP)" in ggml-cuda/common.cuh, but
-          # ggml-cuda.cu uses it unguarded -> the HIP build of ggml-hip fails with
-          # "no member named 'lightning_deferred_k'". The lightning indexer itself
-          # has a real ROCm path (lightning_indexer_kernel_vec), so declare the
-          # member for HIP as well instead of disabling the optimisation.
-          # No-op once upstream fixes this (and if it ever flips to declaring it
-          # under HIP upstream, drop this step).
+          # Patch ONLY the genuinely broken upstream form where the member is
+          # hidden from HIP by "#if !defined(GGML_USE_HIP)". Upstream now declares
+          # it unconditionally -- matching on the bare name there would inject a
+          # duplicate member and BREAK the HIP build (that is what failed on
+          # e07675d6e). This is a no-op while upstream stays fixed, and re-arms
+          # itself if the guard ever returns.
           f=ggml/src/ggml-cuda/common.cuh
-          if grep -q 'lightning_deferred_k' "$f" && ! grep -q 'GGML_HIP_LIGHTNING_DEFERRED_K' "$f"; then
-            ln=$(grep -n 'lightning_deferred_k' "$f" | head -1 | cut -d: -f1)
+          decl='std::unordered_set<const void \*> lightning_deferred_k'
+          if grep -q 'GGML_HIP_LIGHTNING_DEFERRED_K' "$f"; then
+            echo "HIP workaround already present"
+          elif grep -B3 "$decl" "$f" | grep -q '#if !defined(GGML_USE_HIP)'; then
+            ln=$(grep -n "$decl" "$f" | head -1 | cut -d: -f1)
             end=$(awk -v n="$ln" 'NR>n && /^#endif/{print NR; exit}' "$f")
             printf '%s\n' \
               '#if defined(GGML_USE_HIP)' \
@@ -61,7 +62,7 @@ jobs:
             echo "patched common.cuh (line $end): declared lightning_deferred_k for HIP"
             sed -n "$((ln-2)),$((end+4))p" "$f"
           else
-            echo "no patch needed for common.cuh"
+            echo "no HIP workaround needed: upstream declares lightning_deferred_k unconditionally"
           fi
 
       - name: Fix build context (.dockerignore)

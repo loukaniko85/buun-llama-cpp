@@ -8,9 +8,9 @@ on:
         type: boolean
         default: false
   schedule:
-    # Weekly. An idle week costs ~2 minutes: the build steps are skipped unless
+    # Daily. An idle day costs ~2 minutes: the build steps are skipped unless
     # upstream actually moved (see "Check for existing image").
-    - cron: "0 17 * * 0"
+    - cron: "0 17 * * *"
   push:
     branches: [master]
 
