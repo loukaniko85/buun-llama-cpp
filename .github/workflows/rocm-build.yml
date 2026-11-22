@@ -140,7 +140,7 @@ jobs:
           h=ggml/src/ggml-cuda/vendors/hip.h
           if ! grep -q 'GGML_HIP_API_ALIASES' "$h"; then
             sed -i 's/^#define cudaGraphInstantiate hipGraphInstantiate$/#define cudaGraphInstantiate(exec, graph, ...) hipGraphInstantiate(exec, graph, nullptr, nullptr, 0)/' "$h"
-            printf '\n// GGML_HIP_API_ALIASES - CUDA names used by upstream kernels but absent in hip.h\n#define cudaMemoryTypeHost hipMemoryTypeHost\n#define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal\n' >> "$h"
+            printf '\n// GGML_HIP_API_ALIASES - CUDA names used by upstream kernels but absent in hip.h\n#define cudaMemoryTypeHost hipMemoryTypeHost\n#define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal\n#define cudaErrorNotReady hipErrorNotReady\n#define cudaErrorNotSupported hipErrorNotSupported\n' >> "$h"
             echo "added HIP aliases to vendors/hip.h"
           else
             echo "HIP aliases already present"
