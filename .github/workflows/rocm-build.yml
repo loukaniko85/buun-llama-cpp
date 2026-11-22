@@ -132,6 +132,20 @@ jobs:
             echo "HIP context members already present"
           fi
 
+      - name: Alias remaining CUDA enums/APIs for HIP
+        run: |
+          # Upstream moe-cache.cu uses CUDA-only names (cudaMemoryTypeHost,
+          # cudaStreamCaptureModeThreadLocal) and the 3-arg cudaGraphInstantiate.
+          # Extend the fork's HIP compatibility header in the build context only.
+          h=ggml/src/ggml-cuda/vendors/hip.h
+          if ! grep -q 'GGML_HIP_API_ALIASES' "$h"; then
+            sed -i 's/^#define cudaGraphInstantiate hipGraphInstantiate$/#define cudaGraphInstantiate(exec, graph, ...) hipGraphInstantiate(exec, graph, nullptr, nullptr, 0)/' "$h"
+            printf '\n// GGML_HIP_API_ALIASES - CUDA names used by upstream kernels but absent in hip.h\n#define cudaMemoryTypeHost hipMemoryTypeHost\n#define cudaStreamCaptureModeThreadLocal hipStreamCaptureModeThreadLocal\n' >> "$h"
+            echo "added HIP aliases to vendors/hip.h"
+          else
+            echo "HIP aliases already present"
+          fi
+
       - name: Fix build context (.dockerignore)
         run: |
           if grep -qxF 'models/*' .dockerignore 2>/dev/null; then
