@@ -65,6 +65,37 @@ jobs:
             echo "no HIP workaround needed: upstream declares lightning_deferred_k unconditionally"
           fi
 
+      - name: Work around upstream HIP break (__ldcg)
+        run: |
+          # ROCm's hip headers only overload __ldcg for __half/__half2. Upstream kernels
+          # call it on float / unsigned int / float4, so the HIP build fails with
+          # "no matching function for call to '__ldcg'". Route generic loads through a
+          # portable helper in common.cuh. Patched in the build context only, so future
+          # upstream merges stay conflict-free and new __ldcg call sites are covered.
+          f=ggml/src/ggml-cuda/common.cuh
+          if ! grep -q 'GGML_HIP_LDCG_HELPER' "$f"; then
+            cat > /tmp/ldcg.helper <<'HELPER'
+          // GGML_HIP_LDCG_HELPER - ROCm only overloads __ldcg for __half/__half2.
+          template<typename T>
+          static __device__ __forceinline__ T ggml_hip_ldcg(const T * ptr) {
+          #if defined(GGML_USE_HIP)
+              return *ptr;
+          #else
+              return __ldcg(ptr);
+          #endif
+          }
+          HELPER
+            awk '/#define STRINGIZE_IMPL/{while ((getline line < "/tmp/ldcg.helper") > 0) print line} {print}' "$f" > /tmp/common.new
+            mv /tmp/common.new "$f"
+            echo "inserted ggml_hip_ldcg helper into common.cuh"
+          else
+            echo "ggml_hip_ldcg helper already present"
+          fi
+          for g in $(grep -rl '__ldcg(' ggml/src/ggml-cuda --include='*.cu' --include='*.cuh' | grep -v 'common.cuh'); do
+            sed -i 's/__ldcg(/ggml_hip_ldcg(/g' "$g"
+            echo "patched $g"
+          done
+
       - name: Fix build context (.dockerignore)
         run: |
           if grep -qxF 'models/*' .dockerignore 2>/dev/null; then

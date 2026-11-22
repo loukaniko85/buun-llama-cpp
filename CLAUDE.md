@@ -170,6 +170,9 @@ This fork exists to publish ready-to-run server containers. Only three workflows
   `ROCM_DOCKER_ARCH=gfx1100;gfx1150;gfx1151`.
 - The HIP `lightning_deferred_k` workaround only patches when upstream actually guards the member
   with `#if !defined(GGML_USE_HIP)` — it must not patch the current unconditional declaration.
+- The HIP `__ldcg` workaround routes generic loads through `ggml_hip_ldcg` (plain dereference on
+  HIP); ROCm only overloads `__ldcg` for `__half`/`__half2`, so upstream calls on float/int/float4
+  otherwise fail to compile. Both patches are applied to the build context only.
 
 ## Git Conventions
 - Branch per experiment; keep experiment branches as archives (negative results are records too).
