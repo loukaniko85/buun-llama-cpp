@@ -172,7 +172,9 @@ This fork exists to publish ready-to-run server containers. Only three workflows
   with `#if !defined(GGML_USE_HIP)` — it must not patch the current unconditional declaration.
 - The HIP `__ldcg` workaround routes generic loads through `ggml_hip_ldcg` (plain dereference on
   HIP); ROCm only overloads `__ldcg` for `__half`/`__half2`, so upstream calls on float/int/float4
-  otherwise fail to compile. Both patches are applied to the build context only.
+  otherwise fail to compile. A third step declares HIP-compatible copies of context members that
+  upstream hides behind `#if !defined(GGML_USE_HIP)` even though HIP kernels use them. All three
+  patches are applied to the build context only, so upstream merges stay conflict-free.
 
 ## Git Conventions
 - Branch per experiment; keep experiment branches as archives (negative results are records too).

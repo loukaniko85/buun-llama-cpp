@@ -96,6 +96,42 @@ jobs:
             echo "patched $g"
           done
 
+      - name: Expose HIP-guarded context members
+        run: |
+          # Upstream hides a block of ggml_backend_cuda_context members behind
+          # "#if !defined(GGML_USE_HIP)", but HIP-compiled kernels (gated_delta_net,
+          # lightning-indexer, ...) use them unguarded -> "no member named ...".
+          # Declare HIP-compatible copies just after that guarded block.
+          f=ggml/src/ggml-cuda/common.cuh
+          if ! grep -q 'GGML_HIP_CONTEXT_MEMBERS' "$f"; then
+            awk '
+              /consume_int8_channel_activation/ { in_func=1 }
+              in_func && /^#endif/ {
+                print
+                print "#if defined(GGML_USE_HIP)"
+                print "    // GGML_HIP_CONTEXT_MEMBERS - upstream guards these from HIP but the kernels use them."
+                print "    struct gdn_state_read_entry {"
+                print "        const ggml_tensor * gdn        = nullptr;"
+                print "        const float *       base       = nullptr;"
+                print "        const int32_t *     rows       = nullptr;"
+                print "        int64_t             row_stride = 0;"
+                print "        bool                used       = false;"
+                print "    };"
+                print "    std::vector<gdn_state_read_entry> gdn_state_reads;"
+                print "    int64_t gdn_state_read_count = 0;"
+                print "    std::unordered_set<const void *> lightning_deferred_k;"
+                print "#endif"
+                in_func=0
+                next
+              }
+              {print}
+            ' "$f" > /tmp/common.new
+            mv /tmp/common.new "$f"
+            echo "exposed gdn_state_reads / gdn_state_read_count / lightning_deferred_k for HIP"
+          else
+            echo "HIP context members already present"
+          fi
+
       - name: Fix build context (.dockerignore)
         run: |
           if grep -qxF 'models/*' .dockerignore 2>/dev/null; then
